@@ -48,7 +48,8 @@ using mm_ui::TextColor;
 
 constexpr int kRefreshMs = 100;
 constexpr int kCameraRefreshMs = 33; // allows up to 30fps camera display
-constexpr int kMonitorMinRows = 16;
+constexpr int kMonitorMinRows = 17;
+constexpr int kMonitorMinCols = 70;
 
 std::shared_ptr<vsomeip::application> app;
 std::mutex state_mutex;
@@ -99,6 +100,16 @@ void on_engine_reverse_event(const std::shared_ptr<vsomeip::message> &event) {
     update_state([&](ClientState &s) { s.reverse_event(reversed); });
 }
 
+void on_engine_parking_hold_event(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    if (!payload || payload->get_length() != 4)
+        return;
+    const std::uint32_t enabled = payload_get_arg(payload);
+    if (enabled > 1)
+        return;
+    update_state([&](ClientState &s) { s.parking_hold_event(enabled == 1); });
+}
+
 void on_engine_mode_event(const std::shared_ptr<vsomeip::message> &event) {
     const auto payload = event->get_payload();
     if (!payload || payload->get_length() != 4)
@@ -122,6 +133,7 @@ void on_radio_health_event(const std::shared_ptr<vsomeip::message> &event) {
 void on_sensor_availability(vsomeip::service_t, vsomeip::instance_t, bool available) {
     std::lock_guard<std::mutex> lock(sensors_mutex);
     sensor_view.availability(available);
+    update_state([&](ClientState &s) { s.sensor_availability(available); });
 }
 
 void on_sensor_status(const std::shared_ptr<vsomeip::message> &event) {
@@ -130,7 +142,8 @@ void on_sensor_status(const std::shared_ptr<vsomeip::message> &event) {
     if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), status))
         return;
     std::lock_guard<std::mutex> lock(sensors_mutex);
-    sensor_view.status(status, std::chrono::steady_clock::now());
+    if (sensor_view.status(status, std::chrono::steady_clock::now()))
+        update_state([&](ClientState &s) { s.sensor_message_event(); });
 }
 
 void on_sensor_frame(const std::shared_ptr<vsomeip::message> &event) {
@@ -139,7 +152,8 @@ void on_sensor_frame(const std::shared_ptr<vsomeip::message> &event) {
     if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), frame))
         return;
     std::lock_guard<std::mutex> lock(sensors_mutex);
-    sensor_view.frame(std::move(frame), std::chrono::steady_clock::now());
+    if (sensor_view.frame(std::move(frame), std::chrono::steady_clock::now()))
+        update_state([&](ClientState &s) { s.sensor_message_event(); });
 }
 
 void on_sensor_ultrasonic(const std::shared_ptr<vsomeip::message> &event) {
@@ -148,7 +162,18 @@ void on_sensor_ultrasonic(const std::shared_ptr<vsomeip::message> &event) {
     if (!payload || !sensors::decode(payload->get_data(), payload->get_length(), ranges))
         return;
     std::lock_guard<std::mutex> lock(sensors_mutex);
-    sensor_view.ultrasonic(ranges, std::chrono::steady_clock::now());
+    if (sensor_view.ultrasonic(ranges, std::chrono::steady_clock::now()))
+        update_state([&](ClientState &s) { s.sensor_message_event(); });
+}
+
+void on_sensor_health_event(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    if (!payload)
+        return;
+    demo_health::Message message;
+    if (!demo_health::decode(payload->get_data(), payload->get_length(), message))
+        return;
+    update_state([&](ClientState &s) { s.sensors_health_event(message); });
 }
 
 void on_engine_health_event(const std::shared_ptr<vsomeip::message> &event) {
@@ -195,6 +220,8 @@ void request_engine_events() {
                                   ENGINE_HEALTH_EVENT_ID, on_engine_health_event);
     app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                                   ENGINE_MODE_EVENT_ID, on_engine_mode_event);
+    app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                                  ENGINE_PARKING_HOLD_EVENT_ID, on_engine_parking_hold_event);
     const std::set<vsomeip::eventgroup_t> reverse_group{ENGINE_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                        ENGINE_REVERSE_EVENT_ID, reverse_group,
@@ -202,6 +229,9 @@ void request_engine_events() {
     const std::set<vsomeip::eventgroup_t> mode_group{ENGINE_MODE_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                        ENGINE_MODE_EVENT_ID, mode_group,
+                       vsomeip::event_type_e::ET_FIELD);
+    app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                       ENGINE_PARKING_HOLD_EVENT_ID, mode_group,
                        vsomeip::event_type_e::ET_FIELD);
     const std::set<vsomeip::eventgroup_t> health_group{ENGINE_HEALTH_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
@@ -219,7 +249,10 @@ void request_sensor_events() {
                                   SENSORS_CAMERA_FRAME_EVENT_ID, on_sensor_frame);
     app->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
                                   SENSORS_ULTRASONIC_EVENT_ID, on_sensor_ultrasonic);
+    app->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                                  SENSORS_HEALTH_EVENT_ID, on_sensor_health_event);
     for (const auto &binding : {
+            std::make_pair(SENSORS_HEALTH_EVENT_ID, SENSORS_HEALTH_EVENTGROUP_ID),
             std::make_pair(SENSORS_CAMERA_STATUS_EVENT_ID, SENSORS_CAMERA_STATUS_EVENTGROUP_ID),
             std::make_pair(SENSORS_CAMERA_FRAME_EVENT_ID, SENSORS_CAMERA_EVENTGROUP_ID),
             std::make_pair(SENSORS_ULTRASONIC_EVENT_ID, SENSORS_ULTRASONIC_EVENTGROUP_ID)}) {
@@ -353,7 +386,8 @@ public:
         wtimeout(stdscr, milliseconds);
     }
 
-    void render(const ClientState &s, bool monitor) const {
+    void render(const ClientState &s, bool monitor,
+                const sensors::ClientView &sensor_view, bool parking_pending) const {
         erase();
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -387,7 +421,7 @@ public:
         draw_text(5, 1, content_width,
                   "+/- Volume   SPACE Station   ESC Power   M Monitor   V Video   Q Quit", PairMuted);
         if (monitor)
-            draw_monitor(s, rows, cols);
+            draw_monitor(s, sensor_view, parking_pending, rows, cols);
         refresh();
     }
 
@@ -428,7 +462,7 @@ public:
     }
 
     // Static warning: no animation frames are decoded or advanced in Fast.
-    void render_fast_warning() {
+    void render_fast_warning(const ClientState &s, bool monitor, bool pending) {
         int rows = 0, cols = 0;
         if (!begin_fullscreen(rows, cols))
             return;
@@ -445,12 +479,15 @@ public:
         video_line(center + 11, "Always follow speed limits and road-safety regulations.", PairNormal, false, false, x);
         video_line(center + 13, "X / V  Videomodus verlassen   Q  Quit", PairMuted, false, false, x);
         video_line(center + 14, "============================================================", PairWarning, true, false, x);
+        if (monitor)
+            video_line(0, parking_label(s, pending), PairMuted, true);
         wnoutrefresh(video_window_);
         doupdate();
     }
 
     void render_camera(const sensors::ClientView &view,
-                       std::chrono::steady_clock::time_point now) {
+                       std::chrono::steady_clock::time_point now,
+                       const ClientState &s, bool monitor, bool pending) {
         int rows = 0, cols = 0;
         if (!begin_fullscreen(rows, cols))
             return;
@@ -527,6 +564,8 @@ public:
                 }
             }
         }
+        if (monitor)
+            video_line(0, parking_label(s, pending), PairMuted, true);
         wnoutrefresh(video_window_);
         doupdate();
     }
@@ -773,11 +812,19 @@ private:
 
         if (s.engine.availability != Availability::Available ||
             s.direction == Direction::Unknown) {
-            token("? DIR", PairWarning, true);
+            if (s.last_known_direction != Direction::Unknown)
+                token(std::string("~ ") + direction_text(s.last_known_direction),
+                      PairWarning, true);
+            else
+                token("? DIR", PairWarning, true);
+        } else if (s.mode_stale) {
+            token(std::string("~ ") + direction_text(s.direction), PairWarning, true);
         } else if (s.direction == Direction::Reverse) {
             token("< REV", PairWarning, true);
         } else if (s.direction == Direction::Fast) {
             token("! FAST", PairError, true);
+        } else if (s.direction == Direction::Parking) {
+            token("P PARK", PairMuted, true);
         } else {
             token("> FWD", PairGood, true);
         }
@@ -793,6 +840,8 @@ private:
             token(cpu_label, PairWarning, true);
         if (s.engine.ram.state == Health::Degraded || s.engine.ram.state == Health::Failed)
             token(ram_label, PairError, true);
+        sep();
+        draw_service_status(token, "S", s.sensors);
     }
 
     template <typename Add>
@@ -814,6 +863,7 @@ private:
         case Direction::Forward: return "FWD";
         case Direction::Reverse: return "REV";
         case Direction::Fast: return "FAST";
+        case Direction::Parking: return "PARK";
         case Direction::Unknown: return "UNKNOWN";
         }
         return "UNKNOWN";
@@ -890,57 +940,100 @@ private:
         if (!service.ram_metrics.available)
             return "--";
         std::ostringstream out;
-        out << std::fixed << std::setprecision(0)
-            << service.ram_metrics.allocated_bytes / (1024.0 * 1024.0) << " MiB";
+        out << std::fixed << std::setprecision(0);
+        if (service.ram_metrics.allocated_bytes < 1024 * 1024)
+            out << service.ram_metrics.allocated_bytes / 1024.0 << " KiB";
+        else
+            out << service.ram_metrics.allocated_bytes / (1024.0 * 1024.0) << " MiB";
         return out.str();
     }
 
-    void draw_monitor(const ClientState &s, int rows, int cols) const {
-        if (rows < kMonitorMinRows || cols < 54) {
-            draw_text(7, 1, cols - 2, "Monitor: resize to at least 54x16", PairWarning);
+    static std::string parking_label(const ClientState &s, bool pending) {
+        if (pending)
+            return "P Parking: [WAIT]";
+        if (s.engine.availability != Availability::Available || !s.parking_hold_seen)
+            return "P Parking: [--]";
+        return std::string("P Parking: [") + (s.parking_hold_enabled ? "ON" : "OFF") + "]";
+    }
+
+    void draw_monitor(const ClientState &s, const sensors::ClientView &view,
+                      bool pending, int rows, int cols) const {
+        if (rows < kMonitorMinRows || cols < kMonitorMinCols) {
+            draw_text(7, 1, cols - 2, "Monitor: resize to at least 70x17", PairWarning);
             return;
         }
-        draw_text(7, 1, cols - 2, "INTERFERENCE MONITOR  (M to close)", PairHeading, true);
-        const int col_radio = std::max(20, cols / 3);
-        const int col_engine = std::max(37, 2 * cols / 3);
-        draw_text(8, col_radio, col_engine - col_radio - 2, "RADIO", PairHeading, true);
-        draw_text(8, col_engine, cols - col_engine - 1, "ENGINE", PairHeading, true);
+        draw_text(7, 1, cols - 2,
+                  "INTERFERENCE MONITOR (M close)  " + parking_label(s, pending),
+                  PairHeading, true);
+        // Fixed columns keep the table readable even on a 200-column terminal.
+        // 70 columns is sufficient: label + 3 x 16-character value columns.
+        constexpr int label_x = 1, radio_x = 19, engine_x = 36, sensor_x = 53;
+        constexpr int label_width = 17, value_width = 16;
+        draw_text(8, radio_x, value_width, "RADIO", PairHeading, true);
+        draw_text(8, engine_x, value_width, "ENGINE", PairHeading, true);
+        draw_text(8, sensor_x, value_width, "SENSORS", PairHeading, true);
         auto line = [&](int row, const std::string &name,
-                        const std::string &radio_value, const std::string &engine_value) {
-            draw_text(row, 1, col_radio - 2, name, PairMuted);
-            draw_text(row, col_radio, col_engine - col_radio - 2, radio_value);
-            draw_text(row, col_engine, cols - col_engine - 1, engine_value);
+                        const std::string &radio_value, const std::string &engine_value,
+                        const std::string &sensor_value) {
+            if (row >= rows)
+                return;
+            draw_text(row, label_x, label_width, name, PairMuted);
+            draw_text(row, radio_x, value_width, radio_value);
+            draw_text(row, engine_x, value_width, engine_value);
+            draw_text(row, sensor_x, value_width, sensor_value);
         };
         line(9,  "Service", availability_text(s.radio.availability),
-               availability_text(s.engine.availability));
-        line(10, "CPU", health_text(s.radio.cpu), health_text(s.engine.cpu));
-        line(11, "RAM", health_text(s.radio.ram), health_text(s.engine.ram));
+             availability_text(s.engine.availability), availability_text(s.sensors.availability));
+        line(10, "CPU", health_text(s.radio.cpu), health_text(s.engine.cpu),
+             health_text(s.sensors.cpu));
+        line(11, "RAM", health_text(s.radio.ram), health_text(s.engine.ram),
+             health_text(s.sensors.ram));
         line(12, "Data link", communication_text(s.radio.communication),
-             communication_text(s.engine.communication));
-        line(13, "Last event", age_text(s.radio), age_text(s.engine));
-        line(14, "CPU share", cpu_text(s.radio, true), cpu_text(s.engine, true));
-        line(15, "Deadline overrun", cpu_text(s.radio, false), cpu_text(s.engine, false));
-        if (rows >= 17)
-            line(16, "Allocated RAM", ram_text(s.radio), ram_text(s.engine));
-        if (rows >= 18) {
-            std::string direction = direction_text(s.direction);
-            if (s.direction == Direction::Unknown &&
-                s.last_known_direction != Direction::Unknown)
-                direction = std::string(direction_text(s.last_known_direction)) + " (last)";
-            line(17, "Direction", "--", direction);
+             communication_text(s.engine.communication), communication_text(s.sensors.communication));
+        line(13, "CPU share", cpu_text(s.radio, true), cpu_text(s.engine, true),
+             cpu_text(s.sensors, true));
+        line(14, "Overrun", cpu_text(s.radio, false), cpu_text(s.engine, false),
+             cpu_text(s.sensors, false));
+        line(15, "Allocated RAM", ram_text(s.radio), ram_text(s.engine),
+             ram_text(s.sensors));
+        line(16, "Last event", age_text(s.radio), age_text(s.engine), age_text(s.sensors));
+        line(17, "Health age", health_age_text(s.radio_health_seen, s.radio_health_at),
+             health_age_text(s.engine_health_seen, s.engine_health_at),
+             health_age_text(s.sensors_health_seen, s.sensors_health_at));
+        line(18, "Health seq", s.radio_health_seen ? std::to_string(s.radio_health_sequence) : "--",
+             s.engine_health_seen ? std::to_string(s.engine_health_sequence) : "--",
+             s.sensors_health_seen ? std::to_string(s.sensors_health_sequence) : "--");
+        std::string direction = direction_text(s.direction);
+        if (s.direction == Direction::Unknown && s.last_known_direction != Direction::Unknown)
+            direction = std::string(direction_text(s.last_known_direction)) + " (last)";
+        else if (s.mode_stale)
+            direction += " (stale)";
+        const auto now = std::chrono::steady_clock::now();
+        std::string camera = "UNKNOWN";
+        switch (view.camera_state(now)) {
+        case sensors::CameraState::Active: camera = "ACTIVE"; break;
+        case sensors::CameraState::Inactive: camera = "INACTIVE"; break;
+        case sensors::CameraState::Fault: camera = "FAULT"; break;
+        case sensors::CameraState::Unknown: break;
         }
-        if (rows >= 19)
-            line(18, "Health age", health_age_text(s.radio_health_seen, s.radio_health_at),
-                 health_age_text(s.engine_health_seen, s.engine_health_at));
-        if (rows >= 20)
-            line(19, "Health sequence",
-                 s.radio_health_seen ? std::to_string(s.radio_health_sequence) : "--",
-                 s.engine_health_seen ? std::to_string(s.engine_health_sequence) : "--");
-        if (rows >= 22) {
-            draw_text(21, 1, cols - 2,
-                      "CPU/RAM from SOME/IP health; (demo) = metadata fallback; -- = no measurement",
-                      PairMuted);
+        line(19, "Mode / Camera", "--", direction, camera);
+        std::string distances = "--";
+        if (const auto *echoes = view.fresh_ultrasonic(now)) {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(1);
+            for (unsigned i = 0; i < 4; ++i) {
+                if (i) out << '/';
+                if ((echoes->valid_mask & (1u << i)) != 0)
+                    out << echoes->millimeters[i] / 1000.0;
+                else
+                    out << '-';
+            }
+            distances = out.str();
         }
+        line(20, "Ultrasonic (m)", "--", "--", distances);
+        if (rows > 22)
+            draw_text(22, 1, cols - 2,
+                      "Sensors: actual worker CPU, camera frame buffers (not RSS); (demo) = metadata", PairMuted);
     }
 
     WINDOW *video_window_ = nullptr;
@@ -955,6 +1048,15 @@ private:
     int saved_stderr_ = -1;
     bool colors_ = false;
 };
+
+void set_parking_hold(bool requested) {
+    auto request = vsomeip::runtime::get()->create_request();
+    request->set_service(ENGINE_SERVICE_ID);
+    request->set_instance(ENGINE_INSTANCE_ID);
+    request->set_method(ENGINE_SET_PARKING_HOLD_METHOD_ID);
+    request->set_payload(payload_with_arg(requested ? 1u : 0u));
+    app->send(request);
+}
 
 void handle_key(wint_t key, bool &monitor_visible, bool &off_requested) {
     std::uint32_t method = 0;
@@ -1009,6 +1111,9 @@ int main() {
         });
 
         bool monitor_visible = false;
+        bool parking_pending = false;
+        bool parking_target = false;
+        auto parking_request_at = std::chrono::steady_clock::time_point{};
         bool video_visible = false;
         bool overlay_was_visible = false;
         bool last_media_active = false;
@@ -1025,8 +1130,16 @@ int main() {
                 std::lock_guard<std::mutex> lock(state_mutex);
                 before_input = state;
             }
+            const auto input_now = std::chrono::steady_clock::now();
+            if (parking_pending &&
+                ((before_input.parking_hold_seen &&
+                  before_input.parking_hold_enabled == parking_target) ||
+                 input_now - parking_request_at > std::chrono::seconds(3))) {
+                parking_pending = false;
+                redraw = true;
+            }
             const bool camera_before_input = sensors::show_reverse_camera(
-                    before_input.direction == Direction::Reverse,
+                    before_input.direction == Direction::Reverse && !before_input.mode_stale,
                     monitor_visible, video_visible);
             const bool fast_before_input = before_input.fast_or_last_known_fast();
             terminal.set_input_timeout(camera_before_input ? kCameraRefreshMs :
@@ -1038,6 +1151,17 @@ int main() {
                 redraw = true;
             } else if (result == OK && (key == L'q' || key == L'Q')) {
                 running.store(false);
+            } else if (result == OK && (key == L'p' || key == L'P') && monitor_visible) {
+                // The authoritative setting is an Engine FIELD; never update
+                // the display optimistically before the Engine acknowledges it.
+                if (!parking_pending && before_input.parking_hold_seen &&
+                    before_input.engine.availability == Availability::Available) {
+                    parking_target = !before_input.parking_hold_enabled;
+                    parking_pending = true;
+                    parking_request_at = input_now;
+                    set_parking_hold(parking_target);
+                    redraw = true;
+                }
             } else if (camera_before_input) {
                 // The automatic camera is not dismissible with X/ESC. Only
                 // explicitly changing the monitor/video visibility can hide it.
@@ -1112,6 +1236,7 @@ int main() {
                 const auto now = std::chrono::steady_clock::now();
                 state.refresh_radio_health(now);
                 state.refresh_engine_health(now);
+                state.refresh_sensors_health(now);
                 state.refresh_engine_mode(now);
                 snapshot = state;
             }
@@ -1122,7 +1247,7 @@ int main() {
             }
             const auto now = std::chrono::steady_clock::now();
             const bool camera_visible = sensors::show_reverse_camera(
-                    snapshot.direction == Direction::Reverse,
+                    snapshot.direction == Direction::Reverse && !snapshot.mode_stale,
                     monitor_visible, video_visible);
             const bool fast_warning = snapshot.fast_or_last_known_fast() && video_visible;
             const bool overlay_visible = camera_visible || fast_warning;
@@ -1149,13 +1274,14 @@ int main() {
             }
             if (fast_warning) {
                 if (redraw) {
-                    terminal.render_fast_warning();
+                    terminal.render_fast_warning(snapshot, monitor_visible, parking_pending);
                     redraw = false;
                 }
             } else if (camera_visible) {
                 if (redraw || sensor_snapshot.generation() != rendered_sensor_generation ||
                     now - last_rendered >= std::chrono::milliseconds(250)) {
-                    terminal.render_camera(sensor_snapshot, now);
+                    terminal.render_camera(sensor_snapshot, now, snapshot,
+                                           monitor_visible, parking_pending);
                     rendered_sensor_generation = sensor_snapshot.generation();
                     last_rendered = now;
                     redraw = false;
@@ -1168,7 +1294,7 @@ int main() {
                 }
             } else if (redraw || snapshot.generation != rendered_generation ||
                        (monitor_visible && now - last_rendered >= std::chrono::seconds(1))) {
-                terminal.render(snapshot, monitor_visible);
+                terminal.render(snapshot, monitor_visible, sensor_snapshot, parking_pending);
                 rendered_generation = snapshot.generation;
                 last_rendered = now;
                 redraw = false;
@@ -1192,14 +1318,15 @@ int main() {
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENTGROUP_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENT_ID);
+        app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_PARKING_HOLD_EVENT_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENT_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID);
         app->release_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
         for (auto group : {SENSORS_CAMERA_EVENTGROUP_ID, SENSORS_ULTRASONIC_EVENTGROUP_ID,
-                           SENSORS_CAMERA_STATUS_EVENTGROUP_ID})
+                           SENSORS_CAMERA_STATUS_EVENTGROUP_ID, SENSORS_HEALTH_EVENTGROUP_ID})
             app->unsubscribe(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, group);
         for (auto event : {SENSORS_CAMERA_FRAME_EVENT_ID, SENSORS_ULTRASONIC_EVENT_ID,
-                           SENSORS_CAMERA_STATUS_EVENT_ID})
+                           SENSORS_CAMERA_STATUS_EVENT_ID, SENSORS_HEALTH_EVENT_ID})
             app->release_event(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, event);
         app->release_service(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID);
 

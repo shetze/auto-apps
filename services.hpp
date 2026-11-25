@@ -28,6 +28,8 @@
 #define ENGINE_INSTANCE_ID 1
 
 #define ENGINE_GET_REVERSE_METHOD_ID 1
+// Idempotent set: payload 0=OFF, 1=ON, reply echoes actual state.
+#define ENGINE_SET_PARKING_HOLD_METHOD_ID 2
 
 #define ENGINE_EVENTGROUP_ID 0x4002
 #define ENGINE_REVERSE_EVENT_ID 0x8000 + 1
@@ -35,10 +37,12 @@
 // not receive diagnostic traffic when it subscribes to reverse events.
 #define ENGINE_HEALTH_EVENTGROUP_ID 0x4003
 #define ENGINE_HEALTH_EVENT_ID 0x8000 + 2
-// Independent authoritative Drive/Reverse/Fast field, with a 1 Hz heartbeat.
+// Authoritative Drive/Reverse/Fast/Parking field, with a 1 Hz heartbeat.
 // The legacy reverse boolean above stays available to sensors-service.
 #define ENGINE_MODE_EVENTGROUP_ID 0x4008
 #define ENGINE_MODE_EVENT_ID 0x8000 + 3
+// Current Parking hold setting (FIELD, same eventgroup as Engine mode).
+#define ENGINE_PARKING_HOLD_EVENT_ID 0x8000 + 4
 
 // Simulated rear camera and ultrasonic sensor service. Camera frames are sent
 // over a reliable (TCP) SOME/IP event; the other two independent eventgroups
@@ -51,6 +55,8 @@
 #define SENSORS_CAMERA_FRAME_EVENT_ID 0x8001
 #define SENSORS_ULTRASONIC_EVENT_ID 0x8002
 #define SENSORS_CAMERA_STATUS_EVENT_ID 0x8003
+#define SENSORS_HEALTH_EVENTGROUP_ID 0x4009
+#define SENSORS_HEALTH_EVENT_ID 0x8004
 
 static uint32_t inline
 payload_get_arg(std::shared_ptr<vsomeip::payload> its_payload)

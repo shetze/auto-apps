@@ -1,4 +1,5 @@
 #include "sensors-activation.hpp"
+#include "sensors-health.hpp"
 #include "sensors-simulation.hpp"
 #include "services.hpp"
 
@@ -11,6 +12,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -33,6 +35,14 @@ int positive_env(const char *name, int fallback, int minimum, int maximum) {
         return fallback;
     }
     return static_cast<int>(parsed);
+}
+
+std::uint64_t worker_cpu_ns() {
+    timespec value{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0)
+        return 0;
+    return static_cast<std::uint64_t>(value.tv_sec) * 1000000000ULL +
+           static_cast<std::uint64_t>(value.tv_nsec);
 }
 
 const char *status_name(sensors::CameraState state) {
@@ -97,6 +107,7 @@ public:
         offer_sensor_event(SENSORS_CAMERA_FRAME_EVENT_ID, SENSORS_CAMERA_EVENTGROUP_ID);
         offer_sensor_event(SENSORS_ULTRASONIC_EVENT_ID, SENSORS_ULTRASONIC_EVENTGROUP_ID);
         offer_sensor_event(SENSORS_CAMERA_STATUS_EVENT_ID, SENSORS_CAMERA_STATUS_EVENTGROUP_ID);
+        offer_sensor_event(SENSORS_HEALTH_EVENT_ID, SENSORS_HEALTH_EVENTGROUP_ID);
         return true;
     }
 
@@ -151,6 +162,9 @@ private:
         std::uint32_t ultrasonic_sequence = 0;
         std::uint32_t step = 0;
         Clock::time_point next_status{};
+        Clock::time_point next_health = Clock::now() + seconds(1);
+        sensors_health::Tracker health_tracker(Clock::now(), worker_cpu_ns());
+        sensors::Bytes frame_bytes; // retain the actual buffer across ticks
         Clock::time_point next_frame{};
         Clock::time_point next_ultrasonic{};
         const auto frame_period = nanoseconds(1000000000LL / config_.fps);
@@ -166,7 +180,9 @@ private:
                 std::cout << "SENSORS: Camera " << status_name(state)
                           << " (epoch " << epoch << ")\n";
             }
-            sensors::Bytes status_bytes, frame_bytes, ultrasonic_bytes;
+            sensors::Bytes status_bytes, ultrasonic_bytes, health_bytes;
+            frame_bytes.clear(); // keep capacity for the next encoded frame
+            const auto frame_started = Clock::now();
             if (now >= next_status) {
                 status_bytes = sensors::encode(sensors::CameraStatus{
                         state, epoch, ++status_sequence});
@@ -184,7 +200,12 @@ private:
                     next_ultrasonic = now + milliseconds(200); // 5 Hz
                 }
             }
-            auto deadline = next_status;
+            if (now >= next_health) {
+                health_bytes = demo_health::encode(health_tracker.sample(
+                        now, worker_cpu_ns(), frame_bytes.capacity()));
+                next_health = now + seconds(1);
+            }
+            auto deadline = std::min(next_status, next_health);
             if (state == sensors::CameraState::Active)
                 deadline = std::min(deadline, std::min(next_frame, next_ultrasonic));
             changed_ = false;
@@ -193,6 +214,9 @@ private:
             notify(SENSORS_CAMERA_STATUS_EVENT_ID, status_bytes);
             notify(SENSORS_CAMERA_FRAME_EVENT_ID, frame_bytes);
             notify(SENSORS_ULTRASONIC_EVENT_ID, ultrasonic_bytes);
+            notify(SENSORS_HEALTH_EVENT_ID, health_bytes);
+            if (!frame_bytes.empty())
+                health_tracker.frame_finished(Clock::now() - frame_started, frame_period);
             lock.lock();
             cv_.wait_until(lock, deadline,
                     [this] { return changed_ || !running_.load(); });

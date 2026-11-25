@@ -46,7 +46,8 @@ add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp en
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
 add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
-               sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp services.hpp)
+               sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp
+               sensors-health.hpp demo-health.hpp services.hpp)
 target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
 
 install (
@@ -72,6 +73,9 @@ if(BUILD_TESTING)
     target_compile_definitions(mm-video-test PRIVATE
         VIDEO_DEMO_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/animations/city-traffic.ansi\")
     add_test(NAME mm-video-test COMMAND mm-video-test)
+    add_executable(sensors-health-test tests/sensors-health-test.cpp sensors-health.hpp demo-health.hpp)
+    target_include_directories(sensors-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME sensors-health-test COMMAND sensors-health-test)
     add_executable(sensors-test tests/sensors-test.cpp sensors-simulation.cpp
                    sensors-protocol.hpp sensors-client-state.hpp sensors-activation.hpp)
     target_include_directories(sensors-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

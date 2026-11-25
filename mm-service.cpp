@@ -1104,7 +1104,7 @@ private:
     void set_reversed (bool new_reversed) {
         std::unique_lock<std::mutex> its_lock(main_mutex);
         // Legacy direction event is retained for older engine deployments.
-        // Once the three-mode field arrives it is the single authority.
+        // Once the four-mode field arrives it is the single authority.
         if (!engine_mode_seen_) {
             volume_policy_.set_mode(new_reversed ? demo_modes::EngineMode::Reverse
                                                 : demo_modes::EngineMode::Drive);

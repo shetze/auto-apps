@@ -88,6 +88,25 @@ int main() {
     client.engine_health_event(outgoing);
     assert(client.engine.cpu.state == mm_ui::Health::Unknown);
 
+    client.sensor_availability(true);
+    client.sensor_message_event();
+    assert(client.sensors.communication == mm_ui::Communication::Receiving);
+    client.sensors_health_event(outgoing);
+    assert(client.sensors.cpu.state == mm_ui::Health::Normal);
+    assert(client.sensors.ram.state == mm_ui::Health::Normal);
+    assert(client.sensors_health_sequence == outgoing.sequence);
+    assert(client.sensors.cpu_metrics.available);
+    client.refresh_sensors_health(client.sensors_health_at + 5s);
+    assert(client.sensors.communication == mm_ui::Communication::Stale);
+    assert(client.sensors.cpu.state == mm_ui::Health::Unknown);
+    client.sensor_message_event();
+    assert(client.sensors.communication == mm_ui::Communication::Stale);
+    client.sensors_health_event(outgoing);
+    assert(client.sensors.communication == mm_ui::Communication::Receiving);
+    client.sensor_availability(false);
+    assert(!client.sensors_health_seen);
+    assert(client.sensors.cpu.state == mm_ui::Health::Unknown);
+
     // RAM warning lasts a minimum of 15 seconds, even after recovery.
     engine_demo::demo_ram_warning_state warning;
     const auto start = engine_demo::demo_ram_warning_state::clock::now();

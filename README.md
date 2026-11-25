@@ -8,17 +8,38 @@ other. These apps work both natively and in a container.
 
 ### engine-service
 
-The simulated engine cycles through **Drive (20 s), Fast (10 s), Drive (10 s),
-Reverse (10 s)**. The authoritative three-mode SOME/IP field uses event `0x8003`
-in eventgroup `0x4008` of service `0x1001`; it is sent on transitions and
-refreshed every second. The existing reverse boolean field (`0x8001`,
-eventgroup `0x4002`) and `get_reverse` method remain compatible with
-sensors-service. Only Reverse activates the parking sensors.
+The simulated engine follows a **60-second cycle** starting in Reverse:
 
-With `ENGINE_DEMO_CPU_MS` set to the peak CPU budget per cycle, Drive and
-Reverse consume half the CPU work, Fast the entire budget. A common cycle
-period, instead of a shorter busy loop, creates a visible ~50%/~100% single-core
-utilization contrast (subject to scheduler interference).
+| Phase | Duration | Elapsed time |
+| --- | ---: | ---: |
+| Reverse | 10 s | 0–10 s |
+| Forward (Drive) | 20 s | 10–30 s |
+| Fast | 10 s | 30–40 s |
+| Forward (Drive) | 15 s | 40–55 s |
+| Parking | 5 s | 55–60 s |
+
+The engine transitions back to Reverse after Parking, unless the Parking
+switch was enabled. With `P Parking: [ON]`, the engine **holds indefinitely at
+the next Parking phase**, including when the client disconnects; switching it
+`OFF` while parked starts a fresh **Reverse 10s → Forward 20s** sequence
+immediately. Turning it off before Parking simply lets the current cycle run.
+The engine owns the hold state, not the UI. Phase deadlines use a monotonic
+clock and are anchored to the start of the cycle rather than to completion of
+CPU/RAM demo work, avoiding accumulated timing drift. Very long scheduler or
+memory stalls may still delay the publication of a transition.
+
+The authoritative four-mode SOME/IP field uses event `0x8003` in eventgroup
+`0x4008` of service `0x1001`; values are `Drive=0`, `Reverse=1`, `Fast=2`,
+`Parking=3`. It is sent immediately on changes and refreshed every second.
+The Parking switch uses idempotent method `0x0002` (0=OFF, 1=ON) and status
+field `0x8004` in the same eventgroup. The existing reverse boolean field
+(`0x8001`, eventgroup `0x4002`) and `get_reverse` method remain compatible
+with sensors-service. Only Reverse activates the simulated rear camera.
+
+With `ENGINE_DEMO_CPU_MS` set to the peak CPU budget per cycle, Drive, Reverse
+and Parking use half the CPU work; Fast uses the full budget. A common work
+period, instead of a shorter busy loop, creates a visible ~50%/~100%
+single-core utilization contrast (subject to scheduler interference).
 
 ### multimedia-service
 
@@ -45,8 +66,13 @@ nor moving video is playing, no synthetic CPU workload is generated.
 
 This independent simulation service listens to engine direction and generates
 rear-view camera frames plus four ultrasonic distances over reliable SOME/IP.
-It requires no actual camera or ultrasonic hardware. See below for the wire
-format, configuration and safety limitations.
+It requires no actual camera or ultrasonic hardware. It additionally publishes
+an independent **1 Hz health heartbeat** (`0x8004`, eventgroup `0x4009`) using
+the same 48-byte `demo_health` protocol as Engine and Multimedia. The metrics
+come from the actual sensors worker thread (thread CPU time, elapsed time,
+frame deadline misses and retained camera payload buffer capacity); this is
+**not** a synthetic sensors CPU load or whole-process RSS. See below for the
+wire format, configuration and safety limitations.
 
 ### multimedia-client
 
@@ -64,6 +90,20 @@ animation pauses and resumes at its previous frame when Drive returns.
 the normal radio display remains visible and the automatic volume boost is
 applied by multimedia-service. The client keeps Fast video blocked if the
 last known Fast field becomes stale rather than assuming driving speed is low.
+
+When the interference monitor is visible (`M`), `P` toggles its `Parking`
+switch. The current setting is acknowledged by the Engine's SOME/IP field;
+`[WAIT]` indicates an outstanding request and `[--]` means the state is not
+yet known. The command is available even if a Reverse camera or Fast safety
+warning overlays the expanded monitor. The compact monitor uses fixed-width
+value columns for **Multimedia / Engine / Sensors**, independent of terminal
+width. It reports the sensors worker's health and performance alongside its
+camera state and (when fresh) all four ultrasonic distances. At least 70x17
+terminal characters are needed for the first table rows; 70x23 displays the
+complete table and explanation. If engine mode updates stop for over four
+seconds, the last known mode remains visible marked `stale` rather than
+flashing `? DIR`. A stale Reverse state does not automatically activate a
+camera, and a stale Fast state does not unblock video.
 
 ## Building
 
@@ -141,7 +181,7 @@ restored. While reverse is active, `V` may close an open video library and `M`
 may collapse an open monitor; `X` cannot dismiss the automatic camera overlay.
 `Q` still exits. The simple radio display never forces the camera open.
 
-Three versioned, independent SOME/IP field/eventgroups are provided by service
+Four versioned, independent SOME/IP field/eventgroups are provided by service
 `0x1003`, instance `0x0001`:
 
 | Event | Eventgroup | Meaning / wire format |
@@ -149,6 +189,7 @@ Three versioned, independent SOME/IP field/eventgroups are provided by service
 | `0x8001` | `0x4005` | `CAM1`: camera frame with width, height, epoch, sequence, printable ASCII/color cells |
 | `0x8002` | `0x4006` | `ULT1`: four ultrasonic distances in mm, validity mask, epoch, sequence |
 | `0x8003` | `0x4007` | `CST1`: inactive/active/fault, epoch and sequence (1 Hz heartbeat) |
+| `0x8004` | `0x4009` | `demo_health` v1: CPU/RAM health, real sensors-worker CPU share, frame overrun, buffer bytes, health sequence (1 Hz) |
 
 **Transport:** The sensor instance uses reliable SOME/IP (TCP port `30511`)
 configured in both `/etc/vsomeip.json` templates in `auto-apps.aib.yml`.
@@ -178,6 +219,12 @@ On service loss, fault status, expired status heartbeat (3 s), expired frame
 (1.2 s), or expired ultrasonic sample (2 s), the client displays an explicit
 unavailable/stale indication. It never reuses the last frame as live video.
 A camera epoch prevents frames from an earlier Reverse period from being replayed.
+The Sensors health event is subscribed independently of the camera, so its
+performance remains visible while Forward/Fast/Parking have disabled frames.
+CPU share is measured for the sensors worker thread, not all vsomeip helper
+threads. Allocated RAM denotes the retained camera-frame payload buffer
+capacity, not the resident memory of the entire service. The monitor marks
+old health telemetry stale after four seconds without a valid heartbeat.
 
 The CMake target, RPM manifest, container entrypoint and AIB QM deployment all
 include `sensors-service`. A standalone `sensors.container` Quadlet is also
@@ -186,18 +233,22 @@ application `Sensors` (`0x1003`) and the reliable service configuration. Run
 `ctest --output-on-failure` after building; `sensors-test` exercises the wire
 format, simulation, state transitions, freshness handling and larger frames.
 
-## Fast-mode verification
+## Parking-cycle and Sensors-health verification
 
-Compile and run the tests with `cmake -S . -B build && cmake --build build &&
-ctest --test-dir build --output-on-failure`. The new `demo-modes-test` checks the
-three-mode payload, engine phase order and half/full CPU budgets, non-cumulative
-volume boost and capping, video blocking, lost engine-mode heartbeat, and CPU
-telemetry with paced cycles.
+Build and test with `cmake -S . -B build && cmake --build build &&
+ctest --test-dir build --output-on-failure`. `demo-modes-test` exercises the
+five phases and exact 60-second schedule, anchored deadline catch-up,
+Parking hold/release including the immediate Reverse transition, legacy
+reverse compatibility, Fast video blocking and CPU/volume rules.
+`sensors-health-test` exercises the real-worker telemetry sampler, missed
+frame deadlines, sequence monotonicity and `demo_health` wire format.
+`demo-health-test` covers Sensors availability, telemetry aging and recovery.
 
-To observe the demonstration in deployment, watch `ENGINE: CPU demo metrics`
-and `RADIO: CPU demo metrics` in the respective service logs. With
-`ENGINE_DEMO_CPU_MS=400` and `RADIO_DEMO_CPU_MS=400`, an otherwise idle CPU
-should show roughly 50% core share for Drive/Reverse and radio-only playback,
-and roughly 100% for Fast or moving video, minus the short wait and incidental
-scheduler overhead. These are **synthetic loads**, not driving or functional
-safety implementations. The static warning is informational only.
+On the target system, run all services with the updated binary and SOME/IP
+configurations; expand the monitor with `M` and press `P`. The label should
+change from `[OFF]` through `[WAIT]` to `[ON]` when acknowledged. When the
+cycle reaches Parking it should remain there; pressing `P` again should
+resume Reverse immediately, followed by 20 seconds Forward. Watch the
+`ENGINE: CPU demo metrics` and Sensors health fields for CPU/performance
+samples. The specified 60-second period is the requested simulation schedule,
+not a real vehicle-control or functional-safety implementation.

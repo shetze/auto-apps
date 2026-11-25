@@ -16,10 +16,10 @@ namespace mm_ui {
 
 enum class Availability { Unknown, Available, Unavailable };
 enum class Communication { Unknown, Receiving, Unavailable, Stale };
-enum class ServiceKind { Radio, Engine };
+enum class ServiceKind { Radio, Engine, Sensors };
 enum class Health { Unknown, Normal, Degraded, Failed };
 enum class Evidence { None, DemoIndicator, Telemetry };
-enum class Direction { Unknown, Forward, Reverse, Fast };
+enum class Direction { Unknown, Forward, Reverse, Fast, Parking };
 enum class TextColor { Default, Red, Yellow, Magenta };
 
 inline Health health_from_wire(demo_health::Level value) {
@@ -179,10 +179,14 @@ inline StyledText parse_styled_text(const std::string &input) {
 struct ClientState {
     ServiceStatus radio;
     ServiceStatus engine;
+    ServiceStatus sensors;
     Direction direction = Direction::Unknown;
     Direction last_known_direction = Direction::Unknown;
     bool mode_field_seen = false;
+    bool mode_stale = false;
     std::chrono::steady_clock::time_point mode_received_at{};
+    bool parking_hold_seen = false;
+    bool parking_hold_enabled = false;
 
     std::string station;
     std::string title;
@@ -207,6 +211,9 @@ struct ClientState {
     bool engine_health_seen = false;
     std::chrono::steady_clock::time_point engine_health_at{};
     std::uint32_t engine_health_sequence = 0;
+    bool sensors_health_seen = false;
+    std::chrono::steady_clock::time_point sensors_health_at{};
+    std::uint32_t sensors_health_sequence = 0;
 
     void radio_health_event(const demo_health::Message &message) {
         if (radio.availability == Availability::Unavailable)
@@ -230,6 +237,54 @@ struct ClientState {
         engine_health_seen = true;
         engine_health_sequence = message.sequence;
         ++generation;
+    }
+
+    void sensors_health_event(const demo_health::Message &message) {
+        if (sensors.availability == Availability::Unavailable)
+            return;
+        apply_health(sensors, message);
+        sensors_health_at = std::chrono::steady_clock::now();
+        sensors_health_seen = true;
+        sensors_health_sequence = message.sequence;
+        ++generation;
+    }
+
+    // Other sensor events are useful for detecting the data link, even when
+    // camera/ultrasonic frames are not currently shown on screen.
+    void sensor_message_event() {
+        if (sensors.availability == Availability::Unavailable)
+            return;
+        if (sensors.communication == Communication::Stale) {
+            // Frame/status traffic does not make a missing diagnostic
+            // heartbeat fresh again. Keep the link timestamp, not its grade.
+            sensors.last_message = std::chrono::steady_clock::now();
+            sensors.has_message = true;
+        } else {
+            sensors.observe_message();
+        }
+    }
+
+    void sensor_availability(bool online) {
+        sensors.on_availability(online);
+        if (!online) {
+            sensors_health_seen = false;
+            sensors_health_sequence = 0;
+        }
+        ++generation;
+    }
+
+    void refresh_sensors_health(std::chrono::steady_clock::time_point now) {
+        if (!sensors_health_seen || sensors.availability != Availability::Available)
+            return;
+        if (now - sensors_health_at > std::chrono::seconds(4) &&
+            sensors.communication != Communication::Stale) {
+            sensors.communication = Communication::Stale;
+            sensors.cpu = HealthAxis{};
+            sensors.ram = HealthAxis{};
+            sensors.cpu_metrics = CpuMetrics{};
+            sensors.ram_metrics = RamMetrics{};
+            ++generation;
+        }
     }
 
     void refresh_radio_health(std::chrono::steady_clock::time_point now) {
@@ -272,12 +327,14 @@ struct ClientState {
     }
 
     void cpu_health_event(ServiceKind service, Health value, const CpuMetrics &metrics) {
-        (service == ServiceKind::Radio ? radio : engine).update_cpu(value, metrics);
+        (service == ServiceKind::Radio ? radio :
+            service == ServiceKind::Engine ? engine : sensors).update_cpu(value, metrics);
         ++generation;
     }
 
     void ram_health_event(ServiceKind service, Health value, const RamMetrics &metrics) {
-        (service == ServiceKind::Radio ? radio : engine).update_ram(value, metrics);
+        (service == ServiceKind::Radio ? radio :
+            service == ServiceKind::Engine ? engine : sensors).update_ram(value, metrics);
         ++generation;
     }
 
@@ -302,6 +359,9 @@ struct ClientState {
         if (!online) {
             direction = Direction::Unknown;
             mode_field_seen = false;
+            mode_stale = false;
+            parking_hold_seen = false;
+            parking_hold_enabled = false;
             engine_health_seen = false;
         }
         ++generation;
@@ -364,7 +424,7 @@ struct ClientState {
 
     void reverse_event(bool reversing) {
         // Legacy reverse field remains useful until the authoritative
-        // three-mode field is first received. Ordering must not erase Fast.
+        // four-mode field is first received. Ordering must not erase Fast.
         if (engine.availability == Availability::Unavailable || mode_field_seen)
             return;
         direction = reversing ? Direction::Reverse : Direction::Forward;
@@ -384,22 +444,38 @@ struct ClientState {
         case demo_modes::EngineMode::Drive: next = Direction::Forward; break;
         case demo_modes::EngineMode::Reverse: next = Direction::Reverse; break;
         case demo_modes::EngineMode::Fast: next = Direction::Fast; break;
+        case demo_modes::EngineMode::Parking: next = Direction::Parking; break;
         }
         const bool changed = direction != next;
         direction = next;
         last_known_direction = next;
         mode_field_seen = true;
         mode_received_at = now;
+        const bool was_stale = mode_stale;
+        mode_stale = false;
+        engine.observe_message();
+        if (changed || was_stale)
+            ++generation;
+    }
+
+    void parking_hold_event(bool enabled) {
+        if (engine.availability == Availability::Unavailable)
+            return;
+        const bool changed = !parking_hold_seen || parking_hold_enabled != enabled;
+        parking_hold_seen = true;
+        parking_hold_enabled = enabled;
         engine.observe_message();
         if (changed)
             ++generation;
     }
 
     void refresh_engine_mode(std::chrono::steady_clock::time_point now) {
-        if (mode_field_seen && direction != Direction::Unknown &&
+        if (mode_field_seen && !mode_stale &&
             now - mode_received_at > std::chrono::seconds(4)) {
-            // A missing heartbeat is not proof that Fast has ended.
-            direction = Direction::Unknown;
+            // Keep the last known mode visible (with STALE indication) instead
+            // of displaying '? DIR' for seconds between phase changes. The
+            // Fast video interlock stays active while its state is unverified.
+            mode_stale = true;
             ++generation;
         }
     }

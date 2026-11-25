@@ -143,7 +143,8 @@ public:
             main_blocked(false),
             main_running(true),
             is_offered(false),
-            mode_(demo_modes::EngineMode::Drive),
+            mode_(demo_modes::EngineMode::Reverse),
+            cycle_(std::chrono::steady_clock::now()),
             main_thread(std::bind(&engine_service::run, this)) {
     }
 
@@ -165,6 +166,11 @@ public:
                 ENGINE_GET_REVERSE_METHOD_ID,
                 std::bind(&engine_service::on_get_reverse, this,
                           std::placeholders::_1));
+        app->register_message_handler(
+                ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                ENGINE_SET_PARKING_HOLD_METHOD_ID,
+                std::bind(&engine_service::on_set_parking_hold, this,
+                          std::placeholders::_1));
 
         std::set<vsomeip::eventgroup_t> its_groups;
         its_groups.insert(ENGINE_EVENTGROUP_ID);
@@ -179,6 +185,12 @@ public:
                 ENGINE_SERVICE_ID,
                 ENGINE_INSTANCE_ID,
                 ENGINE_MODE_EVENT_ID,
+                std::set<vsomeip::eventgroup_t>{ENGINE_MODE_EVENTGROUP_ID},
+                vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
+                false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
+        app->offer_event(
+                ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                ENGINE_PARKING_HOLD_EVENT_ID,
                 std::set<vsomeip::eventgroup_t>{ENGINE_MODE_EVENTGROUP_ID},
                 vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
                 false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
@@ -249,6 +261,54 @@ public:
         app->send(its_response);
     }
 
+    // Called with main_mutex held. Publishing each transition immediately
+    // avoids waiting for the next 1 Hz health/mode heartbeat.
+    void publish_mode_state(bool force) {
+        const bool reverse = mode_ == demo_modes::EngineMode::Reverse;
+        if (force || !mode_announced_ || reverse != reverse_announced_) {
+            app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                        ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
+            reverse_announced_ = reverse;
+        }
+        if (force || !mode_announced_ || mode_ != announced_mode_) {
+            app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                        ENGINE_MODE_EVENT_ID,
+                        payload_with_arg(static_cast<std::uint32_t>(mode_)));
+            announced_mode_ = mode_;
+        }
+        mode_announced_ = true;
+    }
+
+    void publish_parking_hold_state() {
+        app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                    ENGINE_PARKING_HOLD_EVENT_ID,
+                    payload_with_arg(cycle_.parking_hold_requested() ? 1u : 0u));
+    }
+
+    void on_set_parking_hold(const std::shared_ptr<vsomeip::message> &request) {
+        const auto payload = request->get_payload();
+        if (!payload || payload->get_length() != 4)
+            return;
+        const auto value = payload_get_arg(payload);
+        if (value > 1)
+            return;
+        std::uint32_t actual = 0;
+        {
+            std::lock_guard<std::mutex> lock(main_mutex);
+            if (cycle_.set_parking_hold(value == 1,
+                                        std::chrono::steady_clock::now())) {
+                publish_parking_hold_state();
+                if (mode_ != cycle_.mode()) {
+                    mode_ = cycle_.mode();
+                    publish_mode_state(false);
+                }
+                main_condition.notify_all();
+            }
+            actual = cycle_.parking_hold_requested() ? 1u : 0u;
+        }
+        app->send(response(request, actual));
+    }
+
     void run() {
         const unsigned demo_cpu_ms = demo_cpu_duration_ms();
         const char *lock_env = std::getenv("ENGINE_DEMO_HOLD_MUTEX");
@@ -285,13 +345,11 @@ public:
         }
 
         offer();
-        // Publish an initial forward state so newly connected clients do not
-        // wait for the first 10-second direction transition.
-        app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
-                    ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
-        bool begin_phase = true;
-        std::size_t phase_index = 0;
-        auto phase_deadline = std::chrono::steady_clock::now();
+        cycle_.reset(std::chrono::steady_clock::now());
+        mode_ = cycle_.mode();
+        publish_mode_state(true);
+        publish_parking_hold_state();
+        std::uint64_t prepared_generation = 0; // force initial RAM/phase setup
 
         // The health event is a field and also a heartbeat. The sequence
         // counter makes each sample distinct, even if measurements are stable.
@@ -313,18 +371,16 @@ public:
         };
 
         while (main_running) {
-            if (begin_phase) {
-                begin_phase = false;
-                const auto next = demo_modes::phase(phase_index);
-                const bool old_reverse = mode_ == demo_modes::EngineMode::Reverse;
-                mode_ = next.mode;
-                std::cout << "ENGINE: " << demo_modes::name(mode_) << "..." << std::endl;
-                if (old_reverse != (mode_ == demo_modes::EngineMode::Reverse))
-                    app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
-                                ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
-                app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
-                            ENGINE_MODE_EVENT_ID,
-                            payload_with_arg(static_cast<std::uint32_t>(mode_)));
+            // Anchored monotonic transition deadlines, never reset after work.
+            if (cycle_.advance(std::chrono::steady_clock::now())) {
+                mode_ = cycle_.mode();
+                publish_mode_state(false);
+            }
+            if (prepared_generation != cycle_.generation()) {
+                prepared_generation = cycle_.generation();
+                const auto current = demo_modes::phase(cycle_.phase_index());
+                std::cout << "ENGINE: " << demo_modes::name(current.mode)
+                          << (cycle_.parked() ? " (holding)" : "") << "..." << std::endl;
 
                 if (demo_ram_bytes > 0) {
                     std::string reason;
@@ -368,9 +424,8 @@ public:
                         std::cout << " reason=" << reason << " (warning >=15s)";
                     std::cout << std::endl;
                 }
-                // Four-stage cycle: Drive 20s, Fast 10s, Drive 10s,
-                // Reverse 10s. All transitions are announced via mode field.
-                phase_deadline = std::chrono::steady_clock::now() + next.duration;
+                // Do not restart a phase clock after RAM acquisition:
+                // the 60s schedule is anchored to its original deadlines.
                 publish_health(true);
             }
 
@@ -380,11 +435,11 @@ public:
             if (demo_cpu_ms > 0) {
                 // With HOLD_MUTEX=0, interference is scheduler contention;
                 // with HOLD_MUTEX=1, it also delays get_reverse callbacks.
+                const auto budget = demo_modes::cpu_budget(
+                        demo_cpu_ms, mode_ == demo_modes::EngineMode::Fast);
                 if (!demo_hold_mutex)
                     its_lock.unlock();
                 const auto work_started = std::chrono::steady_clock::now();
-                const auto budget = demo_modes::cpu_budget(
-                        demo_cpu_ms, mode_ == demo_modes::EngineMode::Fast);
                 const std::uint64_t cpu_started_ns = thread_cpu_time_ns();
                 demo_cpu_work(budget);
                 const std::uint64_t consumed_cpu_ns = thread_cpu_time_ns() - cpu_started_ns;
@@ -395,15 +450,17 @@ public:
                 // condition wait releases the mutex for SOME/IP callbacks.
                 const auto period = demo_modes::cpu_period(demo_cpu_ms);
                 const auto cycle_end = work_started + period;
-                main_condition.wait_until(its_lock, cycle_end,
-                                          [&] { return !main_running.load(); });
+                main_condition.wait_until(its_lock,
+                        std::min(cycle_end, std::min(cycle_.deadline(), next_health_report)),
+                        [&] { return !main_running.load(); });
                 const auto cycle_elapsed = std::chrono::steady_clock::now() - work_started;
                 cpu_monitor.record(health, budget.count() / 1000.0,
                                    work_elapsed, cycle_elapsed, consumed_cpu_ns);
             } else {
                 // Wake for the heartbeat and RAM recovery even without CPU work.
-                main_condition.wait_until(its_lock, std::min(phase_deadline,
-                        next_health_report));
+                main_condition.wait_until(its_lock,
+                        std::min(cycle_.deadline(), next_health_report),
+                        [&] { return !main_running.load(); });
             }
 
             if (!main_running)
@@ -419,10 +476,6 @@ public:
             }
             publish_health(false);
 
-            if (now >= phase_deadline) {
-                phase_index = (phase_index + 1) % demo_modes::kPhaseCount;
-                begin_phase = true;
-            }
         }
         ram_working_set.release();
     }
@@ -439,6 +492,10 @@ private:
 
     // Engine state:
     demo_modes::EngineMode mode_;
+    demo_modes::ParkingCycle cycle_;
+    bool mode_announced_ = false;
+    bool reverse_announced_ = false;
+    demo_modes::EngineMode announced_mode_ = demo_modes::EngineMode::Reverse;
 
     // Start the worker only after state and synchronization are initialized.
     std::thread main_thread;
