@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "demo-health.hpp"
+#include "demo-modes.hpp"
 
 // Independent of vsomeip and ncurses so the state model can be tested alone.
 namespace mm_ui {
@@ -18,7 +19,7 @@ enum class Communication { Unknown, Receiving, Unavailable, Stale };
 enum class ServiceKind { Radio, Engine };
 enum class Health { Unknown, Normal, Degraded, Failed };
 enum class Evidence { None, DemoIndicator, Telemetry };
-enum class Direction { Unknown, Forward, Reverse };
+enum class Direction { Unknown, Forward, Reverse, Fast };
 enum class TextColor { Default, Red, Yellow, Magenta };
 
 inline Health health_from_wire(demo_health::Level value) {
@@ -180,6 +181,8 @@ struct ClientState {
     ServiceStatus engine;
     Direction direction = Direction::Unknown;
     Direction last_known_direction = Direction::Unknown;
+    bool mode_field_seen = false;
+    std::chrono::steady_clock::time_point mode_received_at{};
 
     std::string station;
     std::string title;
@@ -298,6 +301,7 @@ struct ClientState {
         engine.on_availability(online);
         if (!online) {
             direction = Direction::Unknown;
+            mode_field_seen = false;
             engine_health_seen = false;
         }
         ++generation;
@@ -359,13 +363,51 @@ struct ClientState {
     }
 
     void reverse_event(bool reversing) {
-        if (engine.availability == Availability::Unavailable)
+        // Legacy reverse field remains useful until the authoritative
+        // three-mode field is first received. Ordering must not erase Fast.
+        if (engine.availability == Availability::Unavailable || mode_field_seen)
             return;
         direction = reversing ? Direction::Reverse : Direction::Forward;
         last_known_direction = direction;
         engine.observe_message();
         refresh_engine_health(std::chrono::steady_clock::now());
         ++generation;
+    }
+
+    void mode_event(demo_modes::EngineMode mode,
+                    std::chrono::steady_clock::time_point now =
+                        std::chrono::steady_clock::now()) {
+        if (engine.availability == Availability::Unavailable)
+            return;
+        Direction next = Direction::Unknown;
+        switch (mode) {
+        case demo_modes::EngineMode::Drive: next = Direction::Forward; break;
+        case demo_modes::EngineMode::Reverse: next = Direction::Reverse; break;
+        case demo_modes::EngineMode::Fast: next = Direction::Fast; break;
+        }
+        const bool changed = direction != next;
+        direction = next;
+        last_known_direction = next;
+        mode_field_seen = true;
+        mode_received_at = now;
+        engine.observe_message();
+        if (changed)
+            ++generation;
+    }
+
+    void refresh_engine_mode(std::chrono::steady_clock::time_point now) {
+        if (mode_field_seen && direction != Direction::Unknown &&
+            now - mode_received_at > std::chrono::seconds(4)) {
+            // A missing heartbeat is not proof that Fast has ended.
+            direction = Direction::Unknown;
+            ++generation;
+        }
+    }
+
+    bool fast_or_last_known_fast() const {
+        return direction == Direction::Fast ||
+               (direction == Direction::Unknown &&
+                last_known_direction == Direction::Fast);
     }
 
 private:

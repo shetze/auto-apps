@@ -31,18 +31,18 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(multimedia-service mm-service.cpp services.hpp demo-health.hpp mm-demo-health.hpp radio-stations.cpp)
+add_executable(multimedia-service mm-service.cpp services.hpp demo-health.hpp mm-demo-health.hpp demo-modes.hpp radio-stations.cpp)
 target_link_libraries(multimedia-service  vsomeip3 ${Boost_LIBRARIES})
 
 add_executable(multimedia-client mm-client.cpp mm-video.cpp mm-video.hpp
-               mm-client-state.hpp demo-health.hpp services.hpp
+               mm-client-state.hpp demo-health.hpp demo-modes.hpp services.hpp
                sensors-protocol.hpp sensors-client-state.hpp)
 target_include_directories(multimedia-client PRIVATE ${CURSES_INCLUDE_DIRS} ${LIBCACA_INCLUDE_DIR})
 target_compile_definitions(multimedia-client PRIVATE
     MM_DEFAULT_VIDEO_DIR=\"${CMAKE_INSTALL_FULL_DATADIR}/auto-apps/animations\")
 target_link_libraries(multimedia-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LIBRARIES} ${LIBCACA_LIBRARY})
 
-add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-memory.hpp)
+add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-memory.hpp demo-modes.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
 add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
@@ -62,6 +62,10 @@ install(DIRECTORY animations/
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(demo-modes-test tests/demo-modes-test.cpp demo-modes.hpp
+                   mm-client-state.hpp mm-demo-health.hpp)
+    target_include_directories(demo-modes-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME demo-modes-test COMMAND demo-modes-test)
     add_executable(mm-video-test tests/mm-video-test.cpp mm-video.cpp mm-video.hpp)
     target_include_directories(mm-video-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LIBCACA_INCLUDE_DIR})
     target_link_libraries(mm-video-test ${LIBCACA_LIBRARY})

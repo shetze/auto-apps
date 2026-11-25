@@ -8,16 +8,38 @@ other. These apps work both natively and in a container.
 
 ### engine-service
 
-This is a very simple service with a field event that signals whether
-the car is reversing, published initially and on direction transitions.
+The simulated engine cycles through **Drive (20 s), Fast (10 s), Drive (10 s),
+Reverse (10 s)**. The authoritative three-mode SOME/IP field uses event `0x8003`
+in eventgroup `0x4008` of service `0x1001`; it is sent on transitions and
+refreshed every second. The existing reverse boolean field (`0x8001`,
+eventgroup `0x4002`) and `get_reverse` method remain compatible with
+sensors-service. Only Reverse activates the parking sensors.
+
+With `ENGINE_DEMO_CPU_MS` set to the peak CPU budget per cycle, Drive and
+Reverse consume half the CPU work, Fast the entire budget. A common cycle
+period, instead of a shorter busy loop, creates a visible ~50%/~100% single-core
+utilization contrast (subject to scheduler interference).
 
 ### multimedia-service
 
 This is a service that emulates a radio, regularly publishing
 information about the current song, radio station and volume. It
 accepts requests to turn on/off, switch channel, and change volume.
-If the engine service is available it will listen for events from it
-and temporarily lower the volume while reversing.
+If the engine service is available it subscribes to the direction events:
+Reverse temporarily lowers volume to 30%, and Fast increases the normal
+volume by **10 percentage points** (capped at 100%). Automatic changes do
+not accumulate; on Drive the original base volume is restored. A missing mode
+heartbeat also retires the volume boost after four seconds. Manual volume
+changes during Reverse become the new base volume.
+
+`RADIO_DEMO_CPU_MS` sets the full CPU-time budget per work cycle. Radio-only
+playback uses half of this budget, while *actually visible* moving video or
+live rear camera frames use the full budget. The client announces video
+presentation using SOME/IP method `0x0006` (`RADIO_SET_VIDEO_ACTIVE_METHOD_ID`)
+every second. The service drops the video load after three seconds without
+a fresh presentation update. Browsing the video library, a Fast warning and
+unavailable camera frames do not count as video playback. If neither radio
+nor moving video is playing, no synthetic CPU workload is generated.
 
 ### sensors-service
 
@@ -34,8 +56,14 @@ are displayed on the screen. `V` opens a full-screen local ASCII/ANSI video
 library with a minimum display size of 100x30 characters. Select animations
 with the arrow keys and Enter. Playback loops until `X` returns to the video
 selection; `V` returns directly to radio, and `Q` quits. `ESC` returns to the
-selection while playing and to radio from the selection. With Reverse active,
-the camera preempts the monitor or video library, but not the basic radio view.
+selection while playing and to radio from the selection. With Reverse active, the camera preempts the monitor or video library,
+but not the basic radio view. In **Fast**, an open video library or an active
+animation is replaced by a **static safety notice** (no moving images); the
+animation pauses and resumes at its previous frame when Drive returns.
+`X`, `V` or Escape can close the blocked video view. If no video view is open,
+the normal radio display remains visible and the automatic volume boost is
+applied by multimedia-service. The client keeps Fast video blocked if the
+last known Fast field becomes stale rather than assuming driving speed is low.
 
 ## Building
 
@@ -82,7 +110,9 @@ to 10 FPS, but a plain text `.fps` sidecar containing an integer between 1 and
 `animation.fps`. `RADIO_VIDEO_DIR` remains accepted as a legacy override. `MM_CLIENT_LOG_FILE` configures the client log destination (legacy `RADIO_CLIENT_LOG_FILE` remains accepted). See `animations/README.md` for details.
 
 In video mode, the multimedia service's SOME/IP connection and radio telemetry continue running.
-Video playback does not issue volume, station or engine commands. Older
+Video playback does not issue volume, station or engine commands. It only
+sends a leased presentation-state signal used to scale the service's synthetic
+CPU workload; it is not a real audio/video decoder on multimedia-service. Older
 Durdraw `.dur` files should first be exported to ANSI; the native `.dur`
 format is not supported.
 
@@ -155,3 +185,19 @@ provided. When deploying on AutoSD, ensure the runtime SOME/IP JSON contains
 application `Sensors` (`0x1003`) and the reliable service configuration. Run
 `ctest --output-on-failure` after building; `sensors-test` exercises the wire
 format, simulation, state transitions, freshness handling and larger frames.
+
+## Fast-mode verification
+
+Compile and run the tests with `cmake -S . -B build && cmake --build build &&
+ctest --test-dir build --output-on-failure`. The new `demo-modes-test` checks the
+three-mode payload, engine phase order and half/full CPU budgets, non-cumulative
+volume boost and capping, video blocking, lost engine-mode heartbeat, and CPU
+telemetry with paced cycles.
+
+To observe the demonstration in deployment, watch `ENGINE: CPU demo metrics`
+and `RADIO: CPU demo metrics` in the respective service logs. With
+`ENGINE_DEMO_CPU_MS=400` and `RADIO_DEMO_CPU_MS=400`, an otherwise idle CPU
+should show roughly 50% core share for Drive/Reverse and radio-only playback,
+and roughly 100% for Fast or moving video, minus the short wait and incidental
+scheduler overhead. These are **synthetic loads**, not driving or functional
+safety implementations. The static warning is informational only.

@@ -39,13 +39,18 @@ public:
     }
 
     CpuSample record_cpu(clock::duration elapsed, std::uint64_t cpu_ns,
-                         clock::time_point now) {
-        const double wall_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+                         clock::time_point now, double active_target_ms = -1.0,
+                         clock::duration cycle_elapsed = clock::duration::zero()) {
+        if (cycle_elapsed == clock::duration::zero())
+            cycle_elapsed = elapsed;
+        const double wall_ms = std::chrono::duration<double, std::milli>(cycle_elapsed).count();
+        const double work_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        const double target_ms = active_target_ms < 0 ? target_cpu_ms_ : active_target_ms;
         const double cpu_ms = static_cast<double>(cpu_ns) / 1000000.0;
         const double off_ms = std::max(0.0, wall_ms - cpu_ms);
         const double share = wall_ms > 0.0 ? 100.0 * cpu_ms / wall_ms : 0.0;
-        const double deadline_ms = target_cpu_ms_ * 1.10 + 10.0;
-        const double overrun_ms = std::max(0.0, wall_ms - deadline_ms);
+        const double deadline_ms = target_ms * 1.10 + 10.0;
+        const double overrun_ms = std::max(0.0, work_ms - deadline_ms);
 
         health_.cpu_metrics_valid = true;
         health_.cpu_share_centi_percent = bounded_u32(std::min(100.0, share) * 100.0);

@@ -24,6 +24,7 @@ using namespace std::literals::chrono_literals;
 #include "services.hpp"
 #include "demo-health.hpp"
 #include "engine-memory.hpp"
+#include "demo-modes.hpp"
 
 namespace {
 
@@ -37,9 +38,9 @@ std::uint64_t thread_cpu_time_ns() {
 }
 
 // Keep the demo workload separate from normal engine state processing.
-void demo_cpu_work(unsigned cpu_ms) {
+void demo_cpu_work(std::chrono::microseconds budget) {
     const std::uint64_t start_ns = thread_cpu_time_ns();
-    const std::uint64_t duration_ns = static_cast<std::uint64_t>(cpu_ms) * 1000000ULL;
+    const std::uint64_t duration_ns = static_cast<std::uint64_t>(budget.count()) * 1000ULL;
     std::uint64_t state = 0x9e3779b97f4a7c15ULL;
 
     while (thread_cpu_time_ns() - start_ns < duration_ns) {
@@ -85,14 +86,16 @@ std::uint32_t clamp_u32(double value) {
 // Hold the warning briefly to avoid flickering between samples.
 class engine_cpu_health {
 public:
-    void record(demo_health::Message &health, unsigned target_ms,
-                std::chrono::steady_clock::duration wall_elapsed,
+    void record(demo_health::Message &health, double target_ms,
+                std::chrono::steady_clock::duration work_elapsed,
+                std::chrono::steady_clock::duration cycle_elapsed,
                 std::uint64_t cpu_elapsed_ns) {
-        const double wall_ms = std::chrono::duration<double, std::milli>(wall_elapsed).count();
+        const double wall_ms = std::chrono::duration<double, std::milli>(cycle_elapsed).count();
+        const double work_ms = std::chrono::duration<double, std::milli>(work_elapsed).count();
         const double cpu_ms = static_cast<double>(cpu_elapsed_ns) / 1000000.0;
         const double off_ms = std::max(0.0, wall_ms - cpu_ms);
         const double deadline_ms = target_ms * 1.10 + 10.0;
-        const double overrun_ms = std::max(0.0, wall_ms - deadline_ms);
+        const double overrun_ms = std::max(0.0, work_ms - deadline_ms);
         const auto now = std::chrono::steady_clock::now();
 
         health.cpu_metrics_valid = true;
@@ -140,7 +143,7 @@ public:
             main_blocked(false),
             main_running(true),
             is_offered(false),
-            in_reverse(false),
+            mode_(demo_modes::EngineMode::Drive),
             main_thread(std::bind(&engine_service::run, this)) {
     }
 
@@ -170,6 +173,13 @@ public:
                 ENGINE_INSTANCE_ID,
                 ENGINE_REVERSE_EVENT_ID,
                 its_groups,
+                vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
+                false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
+        app->offer_event(
+                ENGINE_SERVICE_ID,
+                ENGINE_INSTANCE_ID,
+                ENGINE_MODE_EVENT_ID,
+                std::set<vsomeip::eventgroup_t>{ENGINE_MODE_EVENTGROUP_ID},
                 vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
                 false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
         app->offer_event(
@@ -224,7 +234,7 @@ public:
 
     // Call with lock held
     std::shared_ptr<vsomeip::payload> get_reverse_payload() {
-        return payload_with_arg (in_reverse ? 1 : 0);
+        return payload_with_arg (mode_ == demo_modes::EngineMode::Reverse ? 1 : 0);
     }
 
     void on_get_reverse(const std::shared_ptr<vsomeip::message> &_message) {
@@ -260,7 +270,7 @@ public:
 
         if (demo_cpu_ms > 0) {
             std::cout << "ENGINE: CPU demo enabled (" << demo_cpu_ms
-                      << " ms thread CPU time per cycle, mutex "
+                      << " ms peak thread CPU time per cycle (Drive/Reverse half, Fast full), mutex "
                       << (demo_hold_mutex ? "held" : "released") << ")"
                       << std::endl;
         } else {
@@ -280,6 +290,7 @@ public:
         app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                     ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
         bool begin_phase = true;
+        std::size_t phase_index = 0;
         auto phase_deadline = std::chrono::steady_clock::now();
 
         // The health event is a field and also a heartbeat. The sequence
@@ -294,14 +305,26 @@ public:
             payload->set_data(bytes);
             app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                         ENGINE_HEALTH_EVENT_ID, payload);
+            // A heartbeat lets the UI reject a stale Fast/Drive state.
+            app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                        ENGINE_MODE_EVENT_ID,
+                        payload_with_arg(static_cast<std::uint32_t>(mode_)));
             next_health_report = now + std::chrono::seconds(1);
         };
 
         while (main_running) {
             if (begin_phase) {
                 begin_phase = false;
-                std::cout << (in_reverse ? "ENGINE: Reversing..." : "ENGINE: Driving...")
-                          << std::endl;
+                const auto next = demo_modes::phase(phase_index);
+                const bool old_reverse = mode_ == demo_modes::EngineMode::Reverse;
+                mode_ = next.mode;
+                std::cout << "ENGINE: " << demo_modes::name(mode_) << "..." << std::endl;
+                if (old_reverse != (mode_ == demo_modes::EngineMode::Reverse))
+                    app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                                ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
+                app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                            ENGINE_MODE_EVENT_ID,
+                            payload_with_arg(static_cast<std::uint32_t>(mode_)));
 
                 if (demo_ram_bytes > 0) {
                     std::string reason;
@@ -345,9 +368,9 @@ public:
                         std::cout << " reason=" << reason << " (warning >=15s)";
                     std::cout << std::endl;
                 }
-                // Start each 20s forward / 10s reverse phase after setup.
-                phase_deadline = std::chrono::steady_clock::now()
-                        + (in_reverse ? 10s : 20s);
+                // Four-stage cycle: Drive 20s, Fast 10s, Drive 10s,
+                // Reverse 10s. All transitions are announced via mode field.
+                phase_deadline = std::chrono::steady_clock::now() + next.duration;
                 publish_health(true);
             }
 
@@ -360,15 +383,23 @@ public:
                 if (!demo_hold_mutex)
                     its_lock.unlock();
                 const auto work_started = std::chrono::steady_clock::now();
+                const auto budget = demo_modes::cpu_budget(
+                        demo_cpu_ms, mode_ == demo_modes::EngineMode::Fast);
                 const std::uint64_t cpu_started_ns = thread_cpu_time_ns();
-                demo_cpu_work(demo_cpu_ms);
+                demo_cpu_work(budget);
                 const std::uint64_t consumed_cpu_ns = thread_cpu_time_ns() - cpu_started_ns;
                 const auto work_elapsed = std::chrono::steady_clock::now() - work_started;
                 if (!demo_hold_mutex)
                     its_lock.lock();
-                cpu_monitor.record(health, demo_cpu_ms, work_elapsed, consumed_cpu_ns);
-                // Briefly yield the main mutex for requests and shutdown.
-                main_condition.wait_for(its_lock, 2ms);
+                // Pace against the same cycle period for both modes. The
+                // condition wait releases the mutex for SOME/IP callbacks.
+                const auto period = demo_modes::cpu_period(demo_cpu_ms);
+                const auto cycle_end = work_started + period;
+                main_condition.wait_until(its_lock, cycle_end,
+                                          [&] { return !main_running.load(); });
+                const auto cycle_elapsed = std::chrono::steady_clock::now() - work_started;
+                cpu_monitor.record(health, budget.count() / 1000.0,
+                                   work_elapsed, cycle_elapsed, consumed_cpu_ns);
             } else {
                 // Wake for the heartbeat and RAM recovery even without CPU work.
                 main_condition.wait_until(its_lock, std::min(phase_deadline,
@@ -389,10 +420,7 @@ public:
             publish_health(false);
 
             if (now >= phase_deadline) {
-                in_reverse = !in_reverse;
-                // Preserve the original direction field and notification.
-                app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
-                            ENGINE_REVERSE_EVENT_ID, get_reverse_payload());
+                phase_index = (phase_index + 1) % demo_modes::kPhaseCount;
                 begin_phase = true;
             }
         }
@@ -410,7 +438,7 @@ private:
     bool is_offered;
 
     // Engine state:
-    bool in_reverse;
+    demo_modes::EngineMode mode_;
 
     // Start the worker only after state and synchronization are initialized.
     std::thread main_thread;

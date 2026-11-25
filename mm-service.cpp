@@ -29,6 +29,7 @@ using namespace std::literals::chrono_literals;
 #include "services.hpp"
 #include "radio-stations.hpp"
 #include "mm-demo-health.hpp"
+#include "demo-modes.hpp"
 
 namespace {
 
@@ -42,9 +43,9 @@ std::uint64_t thread_cpu_time_ns() {
 }
 
 // Busy work is intentionally independent of the application's normal logic.
-void demo_cpu_work(unsigned cpu_ms) {
+void demo_cpu_work(std::chrono::microseconds budget) {
     const std::uint64_t start_ns = thread_cpu_time_ns();
-    const std::uint64_t duration_ns = static_cast<std::uint64_t>(cpu_ms) * 1000000ULL;
+    const std::uint64_t duration_ns = static_cast<std::uint64_t>(budget.count()) * 1000ULL;
     std::uint64_t state = 0x9e3779b97f4a7c15ULL;
 
     while (thread_cpu_time_ns() - start_ns < duration_ns) {
@@ -300,17 +301,17 @@ private:
 // This is a synthetic display fault, not a detection of real network corruption.
 // Allow 10% plus 10 ms of scheduling overhead before reporting a missed budget.
 // The number of inserted symbols rises gradually with the wall-clock overrun.
-unsigned demo_garbage_level(unsigned cpu_ms, std::chrono::steady_clock::duration elapsed) {
+unsigned demo_garbage_level(double cpu_ms, std::chrono::steady_clock::duration elapsed) {
     if (cpu_ms == 0)
         return 0;
 
     const double wall_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-    const double tolerance_ms = static_cast<double>(cpu_ms) * 0.10 + 10.0;
-    const double late_ms = wall_ms - static_cast<double>(cpu_ms) - tolerance_ms;
+    const double tolerance_ms = cpu_ms * 0.10 + 10.0;
+    const double late_ms = wall_ms - cpu_ms - tolerance_ms;
     if (late_ms <= 0.0)
         return 0;
 
-    const double relative_delay = late_ms / static_cast<double>(cpu_ms);
+    const double relative_delay = late_ms / cpu_ms;
     const double scaled = 12.0 * relative_delay / (relative_delay + 1.5);
     return std::min(12u, 1u + static_cast<unsigned>(scaled));
 }
@@ -320,7 +321,7 @@ unsigned demo_garbage_level(unsigned cpu_ms, std::chrono::steady_clock::duration
 // stalls; it should not be interpreted as an exact scheduler latency metric.
 class demo_cpu_metrics {
 public:
-    void record(unsigned target_cpu_ms, const mm_demo::CpuSample &sample,
+    void record(double target_cpu_ms, const mm_demo::CpuSample &sample,
                 std::chrono::steady_clock::duration mutex_wait,
                 unsigned garbage_level) {
         const double wall_ms = sample.wall_ms;
@@ -452,10 +453,9 @@ public:
             is_offered(false),
             engine_available(false),
             verbose(false),
-            next_volume(50),
+            volume_policy_(50),
             next_radio_station(0),
             next_playing(false),
-            next_reversed(false),
             main_thread(std::bind(&radio_service::run, this)) {
     }
 
@@ -496,6 +496,12 @@ public:
                 RADIO_INSTANCE_ID,
                 RADIO_SWITCH_STATION_METHOD_ID,
                 std::bind(&radio_service::on_message_switch_station, this,
+                          std::placeholders::_1));
+        app->register_message_handler(
+                RADIO_SERVICE_ID,
+                RADIO_INSTANCE_ID,
+                RADIO_SET_VIDEO_ACTIVE_METHOD_ID,
+                std::bind(&radio_service::on_message_video_active, this,
                           std::placeholders::_1));
 
         std::set<vsomeip::eventgroup_t> its_groups_radio;
@@ -549,6 +555,15 @@ public:
                 its_groups,
                 vsomeip::event_type_e::ET_FIELD);
         app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
+        app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                           ENGINE_MODE_EVENT_ID,
+                           std::set<vsomeip::eventgroup_t>{ENGINE_MODE_EVENTGROUP_ID},
+                           vsomeip::event_type_e::ET_FIELD);
+        app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENTGROUP_ID);
+        app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                                      ENGINE_MODE_EVENT_ID,
+                std::bind(&radio_service::on_engine_mode_event, this,
+                          std::placeholders::_1));
 
         app->register_message_handler(
                 ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID,
@@ -570,6 +585,8 @@ public:
         main_blocked = true;
         main_condition.notify_one();
         app->clear_all_handler();
+        app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENTGROUP_ID);
+        app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENT_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID);
         app->release_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
@@ -588,12 +605,9 @@ public:
     }
 
     void run() {
-        uint32_t current_volume = next_volume;
+        // Always publish the first effective volume as a SOME/IP field.
+        uint32_t current_volume = std::numeric_limits<std::uint32_t>::max();
         bool currently_playing = false;
-        bool current_reversed = false;
-        uint32_t saved_volume;
-        bool next_volume_is_auto = false;
-        bool volume_is_auto = false;
         uint32_t current_station = 0xffffffff;
         const radio_station_info_t *station_info = NULL;
         uint32_t current_song = 0;
@@ -623,7 +637,7 @@ public:
 
         if (demo_cpu_ms > 0) {
             std::cout << "RADIO: CPU demo enabled (" << demo_cpu_ms
-                      << " ms thread CPU time per cycle, mutex "
+                      << " ms peak thread CPU time per cycle (Radio half, moving video full), mutex "
                       << (demo_hold_mutex ? "held" : "released")
                       << "; metrics approximately every 1 s)" << std::endl;
         } else {
@@ -664,30 +678,27 @@ public:
         while (main_running) {
             bool display = false;
             bool station_changed = false;
-
-            if (next_reversed != current_reversed) {
-                if (next_reversed) {
-                    saved_volume = current_volume;
-                    next_volume = 30;
-                    next_volume_is_auto = true;
-                    std::cout << "RADIO: Lowering volume due to reverse" << std::endl;
-                } else {
-                    if (volume_is_auto) {
-                        next_volume = saved_volume;
-                        std::cout << "RADIO: Restoring volume due to cancelled reverse" << std::endl;
-                    }
-                }
-                current_reversed = next_reversed;
+            // An orphaned Fast heartbeat must not hold the boosted volume
+            // forever if an engine connection becomes silent.
+            if (engine_mode_seen_ &&
+                std::chrono::steady_clock::now() - engine_mode_received_at_ >
+                    std::chrono::seconds(4)) {
+                engine_mode_seen_ = false;
+                volume_policy_.set_mode(demo_modes::EngineMode::Drive);
             }
 
-            if (next_volume != current_volume) {
-                current_volume = next_volume;
-                volume_is_auto = next_volume_is_auto;
-                next_volume_is_auto = false;
+            const uint32_t wanted_volume = volume_policy_.current();
+            if (wanted_volume != current_volume) {
+                current_volume = wanted_volume;
                 display = true;
-
-                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_VOLUME_EVENT_ID, payload_with_arg (current_volume));
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                            RADIO_VOLUME_EVENT_ID, payload_with_arg(current_volume));
             }
+            const auto media_now = std::chrono::steady_clock::now();
+            const bool moving_video = media_active_ &&
+                    media_now - media_reported_at_ < std::chrono::seconds(3);
+            const auto active_cpu_budget = demo_modes::cpu_budget(demo_cpu_ms, moving_video);
+            const double active_cpu_ms = active_cpu_budget.count() / 1000.0;
 
             if (next_radio_station != current_station) {
                 current_station = next_radio_station;
@@ -850,7 +861,7 @@ public:
             if (ram_warning_displayed)
                 garbage_level_changed = false;
 
-            if (demo_cpu_ms > 0) {
+            if (demo_cpu_ms > 0 && (next_playing || moving_video)) {
                 // Releasing the mutex isolates CPU scheduling interference.
                 // Holding it additionally delays SOME/IP callbacks that need
                 // access to the radio state, intentionally amplifying failures.
@@ -859,7 +870,7 @@ public:
 
                 const auto work_started = std::chrono::steady_clock::now();
                 const std::uint64_t cpu_started_ns = thread_cpu_time_ns();
-                demo_cpu_work(demo_cpu_ms);
+                demo_cpu_work(active_cpu_budget);
                 const std::uint64_t consumed_cpu_ns = thread_cpu_time_ns() - cpu_started_ns;
                 const auto work_finished = std::chrono::steady_clock::now();
                 const auto work_elapsed = work_finished - work_started;
@@ -872,18 +883,22 @@ public:
 
                 // The demo deliberately corrupts outgoing display text after
                 // missed computation deadlines. It does not modify source data.
-                const unsigned observed_level = demo_garbage_level(demo_cpu_ms, work_elapsed);
+                const unsigned observed_level = demo_garbage_level(active_cpu_ms, work_elapsed);
                 if (observed_level != garbage_level) {
                     garbage_level = observed_level;
                     garbage_level_changed = true;
                 }
+                // Radio and video have a shared cycle period. Video uses
+                // 100% of configured CPU work; radio uses 50% of that budget.
+                const auto period = demo_modes::cpu_period(demo_cpu_ms);
+                const auto cycle_end = work_started + period;
+                main_condition.wait_until(its_lock, cycle_end,
+                                          [&] { return !main_running.load(); });
+                const auto cycle_elapsed = std::chrono::steady_clock::now() - work_started;
                 const auto cpu_sample = health_tracker.record_cpu(
-                        work_elapsed, consumed_cpu_ns, std::chrono::steady_clock::now());
-                demo_metrics.record(demo_cpu_ms, cpu_sample, mutex_wait, garbage_level);
-
-                // Keep the CPU load almost continuous, but briefly release
-                // the mutex to allow state updates and normal shutdown.
-                main_condition.wait_for(its_lock, 2ms);
+                        work_elapsed, consumed_cpu_ns, std::chrono::steady_clock::now(),
+                        active_cpu_ms, cycle_elapsed);
+                demo_metrics.record(active_cpu_ms, cpu_sample, mutex_wait, garbage_level);
 
                 // Preserve song changes despite replacing the original wait.
                 if (next_playing && std::chrono::system_clock::now() >= next_song_at)
@@ -996,6 +1011,36 @@ public:
         app->send(its_response);
     }
 
+    void on_message_video_active(const std::shared_ptr<vsomeip::message> &_request) {
+        const auto payload = _request->get_payload();
+        if (!payload || payload->get_length() != 4)
+            return;
+        const auto value = payload_get_arg(payload);
+        if (value > 1)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(main_mutex);
+            media_active_ = value == 1;
+            media_reported_at_ = std::chrono::steady_clock::now();
+            main_condition.notify_one();
+        }
+        app->send(response(_request, value));
+    }
+
+    void on_engine_mode_event(const std::shared_ptr<vsomeip::message> &_event) {
+        const auto payload = _event->get_payload();
+        if (!payload || payload->get_length() != 4)
+            return;
+        demo_modes::EngineMode mode;
+        if (!demo_modes::decode_mode(payload_get_arg(payload), mode))
+            return;
+        std::lock_guard<std::mutex> lock(main_mutex);
+        engine_mode_seen_ = true;
+        engine_mode_received_at_ = std::chrono::steady_clock::now();
+        volume_policy_.set_mode(mode);
+        main_condition.notify_one();
+    }
+
     void on_engine_reverse_event(const std::shared_ptr<vsomeip::message> &_event) {
         bool reversed = get_arg0(_event) != 0;
         if (verbose)
@@ -1012,6 +1057,11 @@ public:
 
         std::lock_guard<std::mutex> its_lock(main_mutex);
         engine_available = _is_available;
+        if (!_is_available) {
+            engine_mode_seen_ = false;
+            volume_policy_.set_mode(demo_modes::EngineMode::Drive);
+            main_condition.notify_one();
+        }
     }
 
 private:
@@ -1034,27 +1084,14 @@ private:
 
     uint32_t change_volume (int32_t delta_volume) {
         std::unique_lock<std::mutex> its_lock(main_mutex);
-        int32_t new_volume;
-
-        new_volume = (int32_t)next_volume + delta_volume;
-        if (new_volume < 0)
-            new_volume = 0;
-        else {
-            if (new_volume > 100)
-                new_volume = 100;
-        }
-
-        if (next_volume != new_volume) {
-            next_volume = new_volume;
-            main_condition.notify_one();
-        }
-
+        const auto new_volume = volume_policy_.change(delta_volume);
+        main_condition.notify_one();
         return new_volume;
     }
 
     uint32_t get_volume (void) {
         std::unique_lock<std::mutex> its_lock(main_mutex);
-        return next_volume;
+        return volume_policy_.current();
     }
 
     void switch_station (void) {
@@ -1066,8 +1103,13 @@ private:
 
     void set_reversed (bool new_reversed) {
         std::unique_lock<std::mutex> its_lock(main_mutex);
-        next_reversed = new_reversed;
-        main_condition.notify_one();
+        // Legacy direction event is retained for older engine deployments.
+        // Once the three-mode field arrives it is the single authority.
+        if (!engine_mode_seen_) {
+            volume_policy_.set_mode(new_reversed ? demo_modes::EngineMode::Reverse
+                                                : demo_modes::EngineMode::Drive);
+            main_condition.notify_one();
+        }
     }
 
     std::shared_ptr< vsomeip::application > app;
@@ -1081,10 +1123,13 @@ private:
 
     bool verbose;
 
-    uint32_t next_volume;
+    demo_modes::VolumePolicy volume_policy_;
     uint32_t next_radio_station;
     bool next_playing;
-    bool next_reversed;
+    bool engine_mode_seen_ = false;
+    std::chrono::steady_clock::time_point engine_mode_received_at_{};
+    bool media_active_ = false;
+    std::chrono::steady_clock::time_point media_reported_at_{};
 
     // Start the worker only after all state and synchronization are initialized.
     std::thread main_thread;

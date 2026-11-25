@@ -32,6 +32,7 @@
 #include "sensors-client-state.hpp"
 #include "services.hpp"
 #include "demo-health.hpp"
+#include "demo-modes.hpp"
 
 namespace {
 
@@ -96,6 +97,16 @@ void on_engine_availability(vsomeip::service_t, vsomeip::instance_t, bool availa
 void on_engine_reverse_event(const std::shared_ptr<vsomeip::message> &event) {
     const bool reversed = get_arg0(event) != 0;
     update_state([&](ClientState &s) { s.reverse_event(reversed); });
+}
+
+void on_engine_mode_event(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    if (!payload || payload->get_length() != 4)
+        return;
+    demo_modes::EngineMode mode;
+    if (!demo_modes::decode_mode(payload_get_arg(payload), mode))
+        return;
+    update_state([&](ClientState &s) { s.mode_event(mode); });
 }
 
 void on_radio_health_event(const std::shared_ptr<vsomeip::message> &event) {
@@ -182,15 +193,22 @@ void request_engine_events() {
                                   ENGINE_REVERSE_EVENT_ID, on_engine_reverse_event);
     app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                                   ENGINE_HEALTH_EVENT_ID, on_engine_health_event);
+    app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                                  ENGINE_MODE_EVENT_ID, on_engine_mode_event);
     const std::set<vsomeip::eventgroup_t> reverse_group{ENGINE_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                        ENGINE_REVERSE_EVENT_ID, reverse_group,
+                       vsomeip::event_type_e::ET_FIELD);
+    const std::set<vsomeip::eventgroup_t> mode_group{ENGINE_MODE_EVENTGROUP_ID};
+    app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                       ENGINE_MODE_EVENT_ID, mode_group,
                        vsomeip::event_type_e::ET_FIELD);
     const std::set<vsomeip::eventgroup_t> health_group{ENGINE_HEALTH_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                        ENGINE_HEALTH_EVENT_ID, health_group,
                        vsomeip::event_type_e::ET_FIELD);
     app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
+    app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENTGROUP_ID);
     app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
 }
 
@@ -405,6 +423,28 @@ public:
         } else {
             draw_video_library(player, rows, cols);
         }
+        wnoutrefresh(video_window_);
+        doupdate();
+    }
+
+    // Static warning: no animation frames are decoded or advanced in Fast.
+    void render_fast_warning() {
+        int rows = 0, cols = 0;
+        if (!begin_fullscreen(rows, cols))
+            return;
+        const int x = std::max(0, (cols - 66) / 2);
+        const int center = std::max(0, rows / 2 - 7);
+        video_line(center,     "============================================================", PairWarning, true, false, x);
+        video_line(center + 2, "       +---------------------------+", PairError, true, false, x);
+        video_line(center + 3, "       |       !!  FAST  !!       |", PairError, true, false, x);
+        video_line(center + 4, "       |    VIDEO DEAKTIVIERT     |", PairError, true, false, x);
+        video_line(center + 5, "       +---------------------------+", PairError, true, false, x);
+        video_line(center + 7, "SICHERHEITSHINWEIS / DRIVING SAFETY NOTICE", PairHeading, true, false, x);
+        video_line(center + 9, "Geschwindigkeitsbegrenzungen und Verkehrsregeln beachten!", PairWarning, true, false, x);
+        video_line(center + 10, "Blick auf die Strasse richten; keine Videos waehrend der Fahrt.", PairNormal, false, false, x);
+        video_line(center + 11, "Always follow speed limits and road-safety regulations.", PairNormal, false, false, x);
+        video_line(center + 13, "X / V  Videomodus verlassen   Q  Quit", PairMuted, false, false, x);
+        video_line(center + 14, "============================================================", PairWarning, true, false, x);
         wnoutrefresh(video_window_);
         doupdate();
     }
@@ -736,6 +776,8 @@ private:
             token("? DIR", PairWarning, true);
         } else if (s.direction == Direction::Reverse) {
             token("< REV", PairWarning, true);
+        } else if (s.direction == Direction::Fast) {
+            token("! FAST", PairError, true);
         } else {
             token("> FWD", PairGood, true);
         }
@@ -771,6 +813,7 @@ private:
         switch (value) {
         case Direction::Forward: return "FWD";
         case Direction::Reverse: return "REV";
+        case Direction::Fast: return "FAST";
         case Direction::Unknown: return "UNKNOWN";
         }
         return "UNKNOWN";
@@ -967,7 +1010,9 @@ int main() {
 
         bool monitor_visible = false;
         bool video_visible = false;
-        bool camera_was_visible = false;
+        bool overlay_was_visible = false;
+        bool last_media_active = false;
+        auto last_media_report = std::chrono::steady_clock::time_point{};
         bool off_requested = false;
         mm_video::Player video(mm_video::media_directory());
         std::uint64_t rendered_generation = static_cast<std::uint64_t>(-1);
@@ -983,8 +1028,10 @@ int main() {
             const bool camera_before_input = sensors::show_reverse_camera(
                     before_input.direction == Direction::Reverse,
                     monitor_visible, video_visible);
+            const bool fast_before_input = before_input.fast_or_last_known_fast();
             terminal.set_input_timeout(camera_before_input ? kCameraRefreshMs :
-                    (video_visible ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs));
+                    (video_visible && !fast_before_input
+                     ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs));
             wint_t key = 0;
             const int result = terminal.read_key(key);
             if (result == KEY_CODE_YES && key == KEY_RESIZE) {
@@ -1005,6 +1052,18 @@ int main() {
                         video.browse();
                         video_visible = true;
                     }
+                    redraw = true;
+                }
+            } else if (fast_before_input && video_visible) {
+                // Fast warning is a non-dismissible video safety interlock.
+                // X/V closes the video intent; it cannot start playback.
+                if (result == OK && (key == L'v' || key == L'V' ||
+                                     key == L'x' || key == L'X' || key == 27)) {
+                    video.stop();
+                    video_visible = false;
+                    redraw = true;
+                } else if (result == OK && (key == L'm' || key == L'M')) {
+                    monitor_visible = !monitor_visible;
                     redraw = true;
                 }
             } else if (video_visible) {
@@ -1053,6 +1112,7 @@ int main() {
                 const auto now = std::chrono::steady_clock::now();
                 state.refresh_radio_health(now);
                 state.refresh_engine_health(now);
+                state.refresh_engine_mode(now);
                 snapshot = state;
             }
             sensors::ClientView sensor_snapshot;
@@ -1064,15 +1124,35 @@ int main() {
             const bool camera_visible = sensors::show_reverse_camera(
                     snapshot.direction == Direction::Reverse,
                     monitor_visible, video_visible);
-            if (camera_visible != camera_was_visible) {
-                if (camera_visible)
+            const bool fast_warning = snapshot.fast_or_last_known_fast() && video_visible;
+            const bool overlay_visible = camera_visible || fast_warning;
+            if (overlay_visible != overlay_was_visible) {
+                if (overlay_visible)
                     video.pause(now);
                 else
                     video.resume(now);
-                camera_was_visible = camera_visible;
+                overlay_was_visible = overlay_visible;
                 redraw = true;
             }
-            if (camera_visible) {
+            // The multimedia service only burns the full CPU budget when an
+            // actual moving image is on screen. A warning or library is idle.
+            const bool moving_media = (camera_visible &&
+                    sensor_snapshot.fresh_frame(now) != nullptr) ||
+                    (video_visible && video.playing() && !overlay_visible);
+            if (snapshot.radio.availability == Availability::Available &&
+                (moving_media != last_media_active ||
+                 now - last_media_report >= std::chrono::seconds(1))) {
+                app->send(new_request(RADIO_SET_VIDEO_ACTIVE_METHOD_ID,
+                                      moving_media ? 1 : 0));
+                last_media_active = moving_media;
+                last_media_report = now;
+            }
+            if (fast_warning) {
+                if (redraw) {
+                    terminal.render_fast_warning();
+                    redraw = false;
+                }
+            } else if (camera_visible) {
                 if (redraw || sensor_snapshot.generation() != rendered_sensor_generation ||
                     now - last_rendered >= std::chrono::milliseconds(250)) {
                     terminal.render_camera(sensor_snapshot, now);
@@ -1095,6 +1175,9 @@ int main() {
             }
         }
 
+        // Release the full-load video lease before disconnecting.
+        if (last_media_active)
+            app->send(new_request(RADIO_SET_VIDEO_ACTIVE_METHOD_ID, 0));
         app->stop();
         vsomeip_thread.join();
         app->clear_all_handler();
@@ -1106,7 +1189,9 @@ int main() {
             app->release_event(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, id);
         app->release_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
+        app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENTGROUP_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
+        app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_MODE_EVENT_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENT_ID);
         app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID);
         app->release_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);

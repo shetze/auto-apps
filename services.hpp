@@ -9,6 +9,8 @@
 #define RADIO_GET_VOLUME_METHOD_ID 3
 #define RADIO_CHANGE_VOLUME_METHOD_ID 4
 #define RADIO_SWITCH_STATION_METHOD_ID 5
+// Client reports actual moving-image presentation (1 Hz lease).
+#define RADIO_SET_VIDEO_ACTIVE_METHOD_ID 6
 
 #define RADIO_EVENTGROUP_ID 0x4001
 
@@ -33,6 +35,10 @@
 // not receive diagnostic traffic when it subscribes to reverse events.
 #define ENGINE_HEALTH_EVENTGROUP_ID 0x4003
 #define ENGINE_HEALTH_EVENT_ID 0x8000 + 2
+// Independent authoritative Drive/Reverse/Fast field, with a 1 Hz heartbeat.
+// The legacy reverse boolean above stays available to sensors-service.
+#define ENGINE_MODE_EVENTGROUP_ID 0x4008
+#define ENGINE_MODE_EVENT_ID 0x8000 + 3
 
 // Simulated rear camera and ultrasonic sensor service. Camera frames are sent
 // over a reliable (TCP) SOME/IP event; the other two independent eventgroups
