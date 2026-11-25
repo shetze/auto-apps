@@ -138,7 +138,7 @@ content:
         Requires=dlt.socket
         
         [Container]
-        Image=quay.io/shetze/atdev:auto-apps
+        Image=localhost/auto-apps
         Network=none
         Volume=/run/vsomeip/:/run/vsomeip/
         Volume=/run/dlt/:/run/dlt/
@@ -164,6 +164,9 @@ content:
         Image=localhost/auto-apps
         Network=none
         Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+        Environment=ENGINE_DEMO_CPU_MS=400
+        Environment=ENGINE_DEMO_HOLD_MUTEX=0
+        Environment=ENGINE_DEMO_RAM_SIZE=10M
         Volume=/var/run/vsomeip/:/var/run/vsomeip/
         Volume=/var/run/dlt/:/var/run/dlt/
         SecurityLabelType=ipc_t
@@ -173,6 +176,27 @@ content:
         Restart=always
         Type=notify
         
+        [Install]
+        WantedBy=multi-user.target
+    - path: /etc/containers/systemd/sensors.container
+      text: |
+        [Unit]
+        Description=simulated rear camera and ultrasonic sensors (QM)
+        Requires=routingmanagerd.service
+        After=routingmanagerd.service
+
+        [Container]
+        Image=localhost/auto-apps
+        Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+        Volume=/run/vsomeip/:/run/vsomeip/
+        Volume=/run/dlt/:/run/dlt/
+        Volume=/run/ipc/:/run/ipc/
+        SecurityLabelType=ipc_t
+        Exec=/usr/bin/sensors-service
+
+        [Service]
+        Restart=always
+
         [Install]
         WantedBy=multi-user.target
     - path: /etc/vsomeip.json
@@ -339,6 +363,9 @@ qm:
           [Container]
           Image=localhost/auto-apps
           Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+          Environment=RADIO_DEMO_CPU_MS=150
+          Environment=RADIO_DEMO_HOLD_MUTEX=1
+          Environment=RADIO_DEMO_RAM_SIZE=256M
           Volume=/run/vsomeip/:/run/vsomeip/
           Volume=/run/dlt/:/run/dlt/
           Volume=/run/ipc/:/run/ipc/
@@ -352,28 +379,28 @@ qm:
           
           [Install]
           WantedBy=multi-user.target
-      - path: /etc/containers/systemd/sensors.container
-        text: |
-          [Unit]
-          Description=simulated rear camera and ultrasonic sensors (QM)
-          Requires=routingmanagerd.service
-          After=routingmanagerd.service
+      #- path: /etc/containers/systemd/sensors.container
+      #  text: |
+      #    [Unit]
+      #    Description=simulated rear camera and ultrasonic sensors (QM)
+      #    Requires=routingmanagerd.service
+      #    After=routingmanagerd.service
 
-          [Container]
-          Image=localhost/auto-apps
-          Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
-          Volume=/run/vsomeip/:/run/vsomeip/
-          Volume=/run/dlt/:/run/dlt/
-          Volume=/run/ipc/:/run/ipc/
-          SecurityLabelType=qm_container_ipc_t
-          Network=host
-          Exec=/usr/bin/sensors-service
+      #   [Container]
+      #    Image=localhost/auto-apps
+      #    Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+      #    Volume=/run/vsomeip/:/run/vsomeip/
+      #    Volume=/run/dlt/:/run/dlt/
+      #    Volume=/run/ipc/:/run/ipc/
+      #    SecurityLabelType=qm_container_ipc_t
+      #    Network=host
+      #    Exec=/usr/bin/sensors-service
 
-          [Service]
-          Restart=always
+      #    [Service]
+      #    Restart=always
 
-          [Install]
-          WantedBy=multi-user.target
+      #    [Install]
+      #    WantedBy=multi-user.target
       - path: /etc/vsomeip.json
         text: |
           {
