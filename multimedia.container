@@ -1,0 +1,19 @@
+[Unit]
+Description=Demo multimedia service container
+Requires=routingmanagerd.socket
+After=routingmanagerd.socket
+
+[Container]
+Image=localhost/auto-apps
+Network=host
+Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+SecurityLabelType=ipc_t
+Volume=/run/vsomeip:/run/vsomeip
+Volume=/run/dlt:/run/dlt
+Exec=/usr/bin/multimedia-service
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,83 @@
+cmake_minimum_required (VERSION 3.5)
+
+project(auto-apps)
+
+include(GNUInstallDirs)
+
+find_package (vsomeip3 2.6.0 REQUIRED)
+set(CURSES_NEED_NCURSES TRUE)
+set(CURSES_NEED_WIDE TRUE)
+find_package(Curses REQUIRED)
+find_package( Boost 1.55 COMPONENTS system thread log REQUIRED )
+
+# libcaca decodes native multi-frame canvases and ASCII/ANSI artwork.  Keep
+# ncursesw as the only terminal renderer (never invoke libcaca's display API).
+find_path(LIBCACA_INCLUDE_DIR NAMES caca.h)
+find_library(LIBCACA_LIBRARY NAMES caca)
+if(NOT LIBCACA_INCLUDE_DIR OR NOT LIBCACA_LIBRARY)
+    message(FATAL_ERROR "libcaca development headers/library not found (install libcaca-devel)")
+endif()
+
+set (INSTALL_LIB_DIR ${CMAKE_INSTALL_LIBDIR} CACHE PATH "Installation directory for libraries")
+set (INSTALL_BIN_DIR ${CMAKE_INSTALL_BINDIR} CACHE PATH "Installation directory for executables")
+set (INSTALL_INCLUDE_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Installation directory for header files")
+
+include_directories (
+    ${Boost_INCLUDE_DIR}
+    ${VSOMEIP_INCLUDE_DIRS}
+)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_executable(multimedia-service mm-service.cpp services.hpp demo-health.hpp mm-demo-health.hpp radio-stations.cpp)
+target_link_libraries(multimedia-service  vsomeip3 ${Boost_LIBRARIES})
+
+add_executable(multimedia-client mm-client.cpp mm-video.cpp mm-video.hpp
+               mm-client-state.hpp demo-health.hpp services.hpp
+               sensors-protocol.hpp sensors-client-state.hpp)
+target_include_directories(multimedia-client PRIVATE ${CURSES_INCLUDE_DIRS} ${LIBCACA_INCLUDE_DIR})
+target_compile_definitions(multimedia-client PRIVATE
+    MM_DEFAULT_VIDEO_DIR=\"${CMAKE_INSTALL_FULL_DATADIR}/auto-apps/animations\")
+target_link_libraries(multimedia-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LIBRARIES} ${LIBCACA_LIBRARY})
+
+add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-memory.hpp)
+target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
+
+add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
+               sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp services.hpp)
+target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
+
+install (
+    TARGETS multimedia-service multimedia-client engine-service sensors-service
+    RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
+)
+
+# Pack an immediately playable 100x30/10fps sample into RPM and container.
+install(DIRECTORY animations/
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/auto-apps/animations"
+        FILES_MATCHING PATTERN "*.caca" PATTERN "*.ansi" PATTERN "*.ans"
+        PATTERN "*.txt" PATTERN "*.asc" PATTERN "*.fps")
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(mm-video-test tests/mm-video-test.cpp mm-video.cpp mm-video.hpp)
+    target_include_directories(mm-video-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${LIBCACA_INCLUDE_DIR})
+    target_link_libraries(mm-video-test ${LIBCACA_LIBRARY})
+    target_compile_definitions(mm-video-test PRIVATE
+        VIDEO_DEMO_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/animations/city-traffic.ansi\")
+    add_test(NAME mm-video-test COMMAND mm-video-test)
+    add_executable(sensors-test tests/sensors-test.cpp sensors-simulation.cpp
+                   sensors-protocol.hpp sensors-client-state.hpp sensors-activation.hpp)
+    target_include_directories(sensors-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME sensors-test COMMAND sensors-test)
+    add_executable(demo-health-test tests/demo-health-test.cpp
+                   demo-health.hpp engine-memory.hpp mm-client-state.hpp)
+    target_include_directories(demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME demo-health-test COMMAND demo-health-test)
+    add_executable(mm-demo-health-test tests/mm-demo-health-test.cpp
+                   demo-health.hpp mm-demo-health.hpp mm-client-state.hpp)
+    target_include_directories(mm-demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME mm-demo-health-test COMMAND mm-demo-health-test)
+endif()
