@@ -366,7 +366,8 @@ public:
             // A heartbeat lets the UI reject a stale Fast/Drive state.
             app->notify(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                         ENGINE_MODE_EVENT_ID,
-                        payload_with_arg(static_cast<std::uint32_t>(mode_)));
+                        payload_with_arg(static_cast<std::uint32_t>(mode_)),
+			true); // Force periodic notification
             next_health_report = now + std::chrono::seconds(1);
         };
 
