@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -27,6 +28,7 @@ using namespace std::literals::chrono_literals;
 #include <vsomeip/vsomeip.hpp>
 
 #include "services.hpp"
+#include "vsomeip-identity.hpp"
 #include "radio-stations.hpp"
 #include "mm-demo-health.hpp"
 #include "demo-modes.hpp"
@@ -466,7 +468,7 @@ public:
     bool init() {
         std::lock_guard<std::mutex> its_lock(main_mutex);
 
-        if (!app->init()) {
+        if (!vsomeip_identity::init(app, RADIO_SERVICE_ID)) {
             std::cerr << "Couldn't initialize application" << std::endl;
             return false;
         }
@@ -618,6 +620,7 @@ public:
             return;
         if (command.target != controller::Target::Multimedia) return;
         if (request->get_client() != CONTROLLER_SERVICE_ID) {
+            vsomeip_identity::denied("MULTIMEDIA", request->get_client(), CONTROLLER_SERVICE_ID);
             command.status = controller::Status::Denied;
             auto reply = vsomeip::runtime::get()->create_response(request);
             auto bytes = vsomeip::runtime::get()->create_payload();

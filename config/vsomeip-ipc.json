@@ -1,0 +1,16 @@
+{
+  "routing": "routingmanagerd",
+  "logging": {
+    "level": "warning",
+    "console": "true",
+    "dlt": "false"
+  },
+  "applications": [
+    { "name": "Multimedia", "id": "0x1000" },
+    { "name": "Engine", "id": "0x1001" },
+    { "name": "Multimedia client", "id": "0x1002" },
+    { "name": "Sensors", "id": "0x1003" },
+    { "name": "Controller", "id": "0x1004" },
+    { "name": "Controller QM Agent", "id": "0x1005" }
+  ]
+}

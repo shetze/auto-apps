@@ -7,6 +7,7 @@ After=routingmanagerd.socket
 Image=localhost/auto-apps
 Network=host
 Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+Environment=VSOMEIP_CONFIGURATION=/usr/share/auto-apps/vsomeip-ipc.json
 SecurityLabelType=ipc_t
 Volume=/run/vsomeip:/run/vsomeip
 Volume=/run/dlt:/run/dlt

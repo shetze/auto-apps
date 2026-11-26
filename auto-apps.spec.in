@@ -75,6 +75,7 @@ fi
 %{_bindir}/controller-host-agent
 %{_libexecdir}/auto-apps/configure-qm-agent-vsomeip.py
 %{_datadir}/auto-apps/animations/
+%{_datadir}/auto-apps/vsomeip-ipc.json
 
 %files selinux
 %attr(0644,root,root) %{_datadir}/selinux/packages/automotive/auto-apps.pp

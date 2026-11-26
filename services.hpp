@@ -15,6 +15,8 @@
 #define CONTROLLER_AGENT_INSTANCE_ID 1
 #define CONTROLLER_AGENT_APPLY_METHOD_ID 0x0001
 
+// Fixed SOME/IP client identifier for the ncurses multimedia client.
+#define MULTIMEDIA_CLIENT_ID 0x1002
 #define RADIO_SERVICE_ID 0x1000
 #define RADIO_INSTANCE_ID 1
 

@@ -2,6 +2,7 @@
 // The agent can only read or tune the fixed Multimedia Quadlet unit.
 // It never receives an arbitrary unit name, command, path or shell fragment.
 #include "services.hpp"
+#include "vsomeip-identity.hpp"
 #include "controller-systemd.hpp"
 #include <vsomeip/vsomeip.hpp>
 #include <atomic>
@@ -17,7 +18,7 @@ class Agent {
 public:
     Agent() : app_(vsomeip::runtime::get()->create_application("Controller QM Agent")) {}
     bool init() {
-        if (!app_ || !app_->init()) return false;
+        if (!app_ || !vsomeip_identity::init(app_, CONTROLLER_AGENT_SERVICE_ID)) return false;
         app_->register_state_handler([this](vsomeip::state_type_e state) {
             if (state == vsomeip::state_type_e::ST_REGISTERED)
                 app_->offer_service(CONTROLLER_AGENT_SERVICE_ID, CONTROLLER_AGENT_INSTANCE_ID);
@@ -30,8 +31,10 @@ public:
                     if (!payload || !controller::decode(payload->get_data(),
                             payload->get_length(), cmd) ||
                             cmd.target != controller::Target::Multimedia) return;
-                    if (request->get_client() != CONTROLLER_SERVICE_ID) return;
-                    if (cmd.knob != controller::Knob::MemoryMax &&
+                    if (request->get_client() != CONTROLLER_SERVICE_ID) {
+                        vsomeip_identity::denied("QM AGENT", request->get_client(), CONTROLLER_SERVICE_ID);
+                        cmd.status = controller::Status::Denied;
+                    } else if (cmd.knob != controller::Knob::MemoryMax &&
                         cmd.knob != controller::Knob::CpuWeight &&
                         cmd.knob != controller::Knob::Affinity)
                         cmd.status = controller::Status::Unsupported;

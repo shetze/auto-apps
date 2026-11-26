@@ -5,6 +5,7 @@
 // only be enabled on an isolated, trusted demo network; this is not a safety
 // controller or a substitute for certified FFI mechanisms.
 #include "services.hpp"
+#include "vsomeip-identity.hpp"
 #include "demo-health.hpp"
 #include "controller-host-ipc.hpp"
 #include <vsomeip/vsomeip.hpp>
@@ -42,7 +43,7 @@ public:
         state_.last.status = controller::Status::Unknown;
     }
     bool init() {
-        if (!app_ || !app_->init()) return false;
+        if (!app_ || !vsomeip_identity::init(app_, CONTROLLER_SERVICE_ID)) return false;
         app_->register_state_handler([this](vsomeip::state_type_e s) {
             if (s == vsomeip::state_type_e::ST_REGISTERED) {
                 app_->offer_service(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID);
@@ -93,6 +94,9 @@ public:
         app_->register_availability_handler(CONTROLLER_AGENT_SERVICE_ID, 1,
                 [this](vsomeip::service_t, vsomeip::instance_t, bool value) {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    if (agent_online_ != value)
+                        std::cerr << "CONTROLLER: QM agent SOME/IP service "
+                                  << (value ? "AVAILABLE" : "UNAVAILABLE") << '\n';
                     agent_online_ = value;
                     if (!value) {
                         for (unsigned k=0; k<3; ++k) {
@@ -166,8 +170,11 @@ private:
         if (!p || !controller::decode(p->get_data(), p->get_length(), cmd)) return;
         // Check routing-manager application ID in addition to explicit opt-in;
         // vsomeip client IDs are a demo guard, NOT cryptographic auth.
-        if (request->get_client() != 0x1002u || !enabled_)
+        if (request->get_client() != MULTIMEDIA_CLIENT_ID || !enabled_) {
+            if (request->get_client() != MULTIMEDIA_CLIENT_ID)
+                vsomeip_identity::denied("CONTROLLER", request->get_client(), MULTIMEDIA_CLIENT_ID);
             cmd.status = controller::Status::Denied;
+        }
         else if (cmd.status != controller::Status::Pending ||
                  !controller::valid(cmd))
             cmd.status = controller::Status::Invalid;

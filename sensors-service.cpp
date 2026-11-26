@@ -4,6 +4,7 @@
 #include "engine-memory.hpp"
 #include "sensors-simulation.hpp"
 #include "services.hpp"
+#include "vsomeip-identity.hpp"
 
 #include <vsomeip/vsomeip.hpp>
 
@@ -82,7 +83,7 @@ public:
     }
 
     bool init() {
-        if (!app_ || !app_->init())
+        if (!app_ || !vsomeip_identity::init(app_, SENSORS_SERVICE_ID))
             return false;
         app_->register_state_handler([this](vsomeip::state_type_e state) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -98,8 +99,10 @@ public:
                     if (!payload || !controller::decode(payload->get_data(),
                             payload->get_length(), cmd) ||
                             cmd.target != controller::Target::Sensors) return;
-                    if (message->get_client() != CONTROLLER_SERVICE_ID) return;
-                    if (cmd.status == controller::Status::Unknown) {
+                    if (message->get_client() != CONTROLLER_SERVICE_ID) {
+                        vsomeip_identity::denied("SENSORS", message->get_client(), CONTROLLER_SERVICE_ID);
+                        cmd.status = controller::Status::Denied;
+                    } else if (cmd.status == controller::Status::Unknown) {
                         cmd.value = tuning_.value(cmd.knob);
                         cmd.status = cmd.value == 0xffffffffu
                             ? controller::Status::Unsupported : controller::Status::Ok;

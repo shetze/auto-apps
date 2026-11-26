@@ -12,8 +12,10 @@ parallel with Engine and Sensors. The restricted native
 through a private Unix socket; it never participates in SOME/IP. The native
 `controller-qm-agent` reads and updates Multimedia container resources in the
 QM systemd manager. Its agent-specific vsomeip configuration is generated at
-startup from the **current QM IP address** without altering the shared
-`/etc/vsomeip.json`.
+startup for the **existing Unix-domain SOME/IP route** (rather than the refused
+Root TCP endpoint `10.88.0.1:31000`), without altering the shared
+`/etc/vsomeip.json`. All apps have explicit, checked client IDs in the RPM's
+`config/vsomeip-ipc.json`.
 
 Press **`C`** in `multimedia-client` to open the Controller; **`T`** enters
 interactive tuning. Per-knob read status now distinguishes unknown, denied,

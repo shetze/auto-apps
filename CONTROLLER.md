@@ -31,31 +31,70 @@ without a shell.
 > *not* authentication. Runtime changes to cgroup controls and RT settings
 > require additional authorization and validation on the target platform.
 
-## QM networking
+## SOME/IP IPC routing and fixed client IDs
 
-Your observed QM partition uses `eth0=10.88.0.3/16`, while the Root routing
-manager is `10.88.0.1:31000`. Binding a QM guest socket to `10.88.0.1` fails
-with `EADDRNOTAVAIL (99)`.
+### Why the QM Agent was offline
 
-The QM-agent unit now runs this preflight before launch:
+On the observed AutoSD installation the native QM agent originally attempted
+TCP routing to `10.88.0.1:31000`. First it failed with `EADDRNOTAVAIL (99)`
+because the QM partition owns `10.88.0.3`, not `10.88.0.1`. After correcting
+the local address it failed with `ECONNREFUSED (111)`: no usable TCP listener
+was accepting connections at the configured Root address/port. This is a
+**transport configuration mismatch**, not a lack of systemd privileges.
 
-```text
-/usr/bin/python3 /usr/libexec/auto-apps/configure-qm-agent-vsomeip.py
-  --input /etc/vsomeip.json
-  --output /run/auto-apps-qm-agent/vsomeip.json
-```
+The working Engine and Multimedia applications use the `routingmanagerd`
+**Unix-domain IPC** path exposed under `/run/vsomeip/vsomeip-0`. Rather than
+introducing a second, currently nonfunctional TCP transport, this change makes
+all demo SOME/IP clients explicitly use that existing routing mode.
 
-It determines the **current** QM source IPv4 address using the kernel route to
-the routing manager, checks that address can be bound locally, and creates an
-**agent-only** configuration. `routing.host.unicast` remains the Root routing
-manager; `routing.guests.unicast` becomes the QM-local address. If a top-level
-`unicast` exists it is also changed to the local address. Application IDs,
-services, port ranges and the original `/etc/vsomeip.json` are not changed.
+- The RPM installs `/usr/share/auto-apps/vsomeip-ipc.json` with
+  `"routing": "routingmanagerd"` and explicit client identifiers.
+- Root Engine, Sensors and Controller Quadlets, and the QM Multimedia Quadlet
+  set `VSOMEIP_CONFIGURATION` to this packaged file. `multimedia-client`
+  launched with `podman exec` inherits the Multimedia container environment.
+- The QM native agent retains its isolated startup preflight:
 
-The agent uses `VSOMEIP_CONFIGURATION=/run/auto-apps-qm-agent/vsomeip.json`.
-The file is regenerated on **each QM-agent start**, so an address change does
-not require manually editing a static IP or restarting unrelated applications.
-If no valid local route exists, preflight fails explicitly and systemd retries.
+  ```sh
+  /usr/bin/python3 /usr/libexec/auto-apps/configure-qm-agent-vsomeip.py \
+    --input /etc/vsomeip.json \
+    --output /run/auto-apps-qm-agent/vsomeip.json
+  ```
+
+  It now changes **only the agent's private configuration** to local
+  `routingmanagerd` IPC and removes TCP host/guest addresses, network service
+  offers and network service discovery. It preserves the configured application
+  IDs and any supported security settings. No IP discovery, no hard-coded
+  `10.88.0.3`, and no dependency on TCP port 31000 remain in the agent's
+  generated configuration. It is regenerated on each agent start (mode `0600`).
+- The Root and QM `/etc/vsomeip.json` files are **not edited**. Root/partition
+  unit ownership and the restricted host-agent socket remain unchanged.
+
+The explicit SOME/IP **client** IDs (independent of service IDs) are:
+
+| Application | Client ID |
+| --- | --- |
+| Multimedia | `0x1000` |
+| Engine | `0x1001` |
+| Multimedia client | `0x1002` |
+| Sensors | `0x1003` |
+| Controller | `0x1004` |
+| Controller QM Agent | `0x1005` |
+
+All six applications now log their **actual** ID on startup and refuse to run
+if it differs from the expected ID; this makes misdeployment visible instead
+of silently generating `DENIED` replies. Engine and Multimedia continue to
+reply `DENIED` for unexpected requesters, and Sensors and QM Agent now also
+return that explicit status instead of dropping the request (`TIMEOUT`).
+Client IDs are **not proof of identity or a security boundary**; privilege
+separation and SELinux authorization still apply.
+
+**Target limitation:** The change is based on the existing local IPC path; an
+AutoSD 10 runtime check must confirm that the native QM agent can access the
+shared socket under its SELinux domain and that this socket reaches the same
+SOME/IP routing fabric as Engine, Controller, and Multimedia. If the QM agent
+cannot reach the socket, inspect its unit's environment, socket mounts and
+AVCs before introducing new capabilities or a TCP listener. A second routing
+manager is not automatically a bridge between two independent SOME/IP domains.
 
 ## Controller display
 
@@ -111,7 +150,7 @@ write authorization. Neither gate replaces proper authentication.
 
 The changed AIB manifest and RPM must be rebuilt into the AutoSD image. **Do
 not hand-edit shared QM `/etc/vsomeip.json` or restart all services just to
-fix the QM-agent address.** A project overlay does not update a running image.
+fix the agent's IPC mode.** A project overlay does not update a running image.
 
 New image (Root context):
 
@@ -134,10 +173,40 @@ ip -br -4 addr
 systemctl show multimedia.service -p MemoryMax -p CPUWeight -p ControlGroup
 ```
 
-The QM-agent journal should print the selected guest address; on the observed
-VM it should be `10.88.0.3`. Root routing host remains `10.88.0.1`. There
-should no longer be `Cannot bind to client port 31493` errors. If it does
-bind but still cannot register, inspect routing-manager logs and SELinux AVCs.
+The QM-agent preflight should print `routing=routingmanagerd`,
+`client=0x1005`, and `no TCP routing requested`. All application journals
+should include an entry such as `VSOMEIP identity: Controller client=0x1004`.
+The previous `Cannot bind to client port 31493` and `Connection refused
+10.88.0.1:31000` errors should be absent. If the QM agent still fails to
+register, inspect `/run/vsomeip/vsomeip-0` inside QM, the routing manager
+logs and SELinux AVCs. If it registers but Multimedia cgroup values remain
+unavailable, inspect the result of `systemctl show multimedia.service` from
+inside QM (not Root).
+
+### Target-system acceptance checks
+
+On the Root system:
+
+```sh
+systemctl status controller.service auto-apps-controller-host-agent.service
+podman exec systemd-controller sh -c 'echo "$VSOMEIP_CONFIGURATION"; grep -A25 applications /usr/share/auto-apps/vsomeip-ipc.json'
+journalctl -b -u controller.service -u engine.service -u sensors.service --no-pager | grep 'VSOMEIP identity'
+```
+
+Inside QM (enter from Root with `podman exec -it qm /bin/bash`):
+
+```sh
+systemctl status auto-apps-qm-agent.service multimedia.service
+python3 -c 'import json; d=json.load(open("/run/auto-apps-qm-agent/vsomeip.json")); print(d["routing"], d["applications"])'
+ls -lZ /run/vsomeip/vsomeip-0
+journalctl -b -u auto-apps-qm-agent.service --no-pager -n 80
+```
+
+The Controller display should receive **QM Multimedia cgroup** values and
+**Engine/Multimedia/Sensors demo CPU/RAM/mutex/RT** GET replies, rather than
+`OFFLINE`/`DENIED`/`TIMEOUT`. If the target system differs, the startup and
+DENIED logs now identify the actual client IDs and the configured transport.
+Verify **read-only values first** before enabling real tuning operations.
 
 On an **existing** image with the former native controller unit, stop and
 disable `auto-apps-controller.service` before switching to the Quadlet-based
@@ -155,12 +224,12 @@ rootless or remapped UIDs fail the Host agent's peer check.
 
 ## Tests and known limits
 
-This change adds tests for the versioned controller status/CPUWeight decoding,
-Host-agent Unix socket protocol and QM isolated configuration generation. The
+This change includes tests for the versioned controller status/CPUWeight
+handling, Host-agent Unix socket protocol, QM UDS-only configuration generation
+and explicit vsomeip application identity / AIB deployment consistency. The
 previous demo modes, health, and sensors unit tests are unchanged.
 
 **Target validation still required:** Build against real `vsomeip3-devel`,
-check Quadlet generation and SELinux rules on AutoSD 10, ensure the QM agent
-registers on the local IP, and test actual `systemctl set-property` and
+check Quadlet generation and SELinux rules on AutoSD 10, ensure the native QM agent registers over the shared IPC socket, and test actual `systemctl set-property` and
 `CAP_SYS_NICE` outcomes. Static syntax tests with a stub are not equivalent
 to a target integration test.

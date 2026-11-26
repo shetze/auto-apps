@@ -1,48 +1,84 @@
 #!/usr/bin/python3
-"""Build a QM-agent-only vsomeip configuration using its current local IPv4.
+"""Create a QM-agent-only vsomeip IPC configuration.
 
-Do NOT modify /etc/vsomeip.json; it is shared with working QM applications.
-The routing manager remains on the Root interface (e.g. 10.88.0.1); the
-routing guest bind address must be owned by this QM network namespace.
+The deployed QM /etc/vsomeip.json may describe a TCP routing host which is
+*not* listening (observed 10.88.0.1:31000 -> ECONNREFUSED). Other working
+AutoSD demo applications use routingmanagerd's shared Unix socket instead.
+This script retains application identities and security policy but disables
+network routing and network service offers for the native QM agent. It never
+rewrites the shared /etc/vsomeip.json.
 """
 import argparse
-import ipaddress
 import json
 import os
 from pathlib import Path
-import socket
 import sys
 
+ROUTER = 'routingmanagerd'
+AGENT = 'Controller QM Agent'
+AGENT_ID = 0x1005
 
-def local_address(manager: str, port: int) -> str:
-    ipaddress.IPv4Address(manager)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.connect((manager, port))  # UDP connect performs routing, no packet sent
-        address = sock.getsockname()[0]
-    if ipaddress.IPv4Address(address).is_unspecified:
-        raise RuntimeError('no QM local IPv4 address selected by kernel')
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as test:
-        test.bind((address, 0))  # fail early if address cannot be locally bound
-    return address
+
+def local_ipc_config(config: dict) -> dict:
+    """Return a standalone local IPC configuration, without TCP routing."""
+    routing = config.get('routing')
+    name = routing.get('host', {}).get('name') if isinstance(routing, dict) else routing
+    if name != ROUTER:
+        raise ValueError(f'expected routing manager {ROUTER!r}, got {name!r}')
+    applications = config.get('applications', [])
+    if not isinstance(applications, list):
+        raise ValueError('applications must be an array')
+    names = set()
+    ids = set()
+    for application in applications:
+        if not isinstance(application, dict):
+            raise ValueError('application must be a JSON object')
+        app_name = application.get('name')
+        raw_id = application.get('id')
+        if not isinstance(app_name, str) or not isinstance(raw_id, (str, int)):
+            raise ValueError('application name and ID are required')
+        app_id = int(raw_id, 0) if isinstance(raw_id, str) else raw_id
+        if app_name in names or app_id in ids or not (1 <= app_id <= 0xffff):
+            raise ValueError('duplicate or invalid SOME/IP client identity')
+        names.add(app_name)
+        ids.add(app_id)
+        if app_name == AGENT and app_id != AGENT_ID:
+            raise ValueError('Controller QM Agent must use client ID 0x1005')
+    if AGENT not in names:
+        raise ValueError('Controller QM Agent must have client ID 0x1005')
+    # Take only the client-side settings we need. Do not unintentionally retain
+    # TCP port definitions or service discovery from the partition manifest.
+    # Keep any explicit security options so an IPC-only change cannot disable
+    # an existing vsomeip security policy.
+    result = {
+        'routing': ROUTER,
+        'logging': config.get('logging', {'level': 'warning', 'console': 'true', 'dlt': 'false'}),
+        'applications': applications,
+    }
+    for key in ('security', 'security-update-whitelist', 'routing-credentials',
+                'check_credentials', 'permissions-uds', 'network'):
+        if key in config:
+            result[key] = config[key]
+    return result
 
 
 def create(input_file: Path, output_file: Path) -> str:
-    cfg = json.loads(input_file.read_text(encoding='utf-8'))
-    host = cfg['routing']['host']
-    manager = host['unicast']
-    address = local_address(manager, int(host.get('port', 31000)))
-    cfg['routing'].setdefault('guests', {})['unicast'] = address
-    # Top-level unicast, when configured, is the local endpoint as well.
-    if 'unicast' in cfg:
-        cfg['unicast'] = address
+    if input_file.resolve() == output_file.resolve():
+        raise ValueError('refusing to overwrite the shared vsomeip configuration')
+    config = json.loads(input_file.read_text(encoding='utf-8'))
+    result = local_ipc_config(config)
     output_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = output_file.with_suffix('.tmp')
-    with temporary.open('w', encoding='utf-8') as fd:
-        os.fchmod(fd.fileno(), 0o600)
-        json.dump(cfg, fd, indent=2)
-        fd.write('\n')
-    os.replace(temporary, output_file)
-    return address
+    try:
+        with temporary.open('w', encoding='utf-8') as fd:
+            os.fchmod(fd.fileno(), 0o600)
+            json.dump(result, fd, indent=2)
+            fd.write('\n')
+        os.replace(temporary, output_file)
+    finally:
+        # On failure the previous active configuration is left untouched.
+        temporary.unlink(missing_ok=True)
+    return ROUTER
 
 
 def main() -> int:
@@ -52,11 +88,14 @@ def main() -> int:
                         default=Path('/run/auto-apps-qm-agent/vsomeip.json'))
     args = parser.parse_args()
     try:
-        local = create(args.input, args.output)
-    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-        print(f'QM vsomeip preflight failed: {exc}', file=sys.stderr)
+        manager = create(args.input, args.output)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError,
+            json.JSONDecodeError) as exc:
+        print(f'QM vsomeip IPC preflight failed: {exc}', file=sys.stderr)
         return 1
-    print(f'QM vsomeip: local guest {local}; host {json.loads(args.input.read_text())["routing"]["host"]["unicast"]}')
+    print(f'QM vsomeip IPC: routing={manager}; client=0x1005; '
+          f'socket={os.environ.get("SOCKET_PATH", "/run/vsomeip/vsomeip-0")}; '
+          'no TCP routing requested', flush=True)
     return 0
 
 

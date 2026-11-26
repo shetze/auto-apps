@@ -31,6 +31,7 @@
 #include "mm-video.hpp"
 #include "sensors-client-state.hpp"
 #include "services.hpp"
+#include "vsomeip-identity.hpp"
 #include "demo-health.hpp"
 #include "demo-modes.hpp"
 #include "controller-ui-state.hpp"
@@ -322,7 +323,7 @@ void request_sensor_events() {
 
 bool setup_vsomeip() {
     app = vsomeip::runtime::get()->create_application("Multimedia client");
-    if (!app || !app->init())
+    if (!app || !vsomeip_identity::init(app, MULTIMEDIA_CLIENT_ID))
         return false;
     app->register_availability_handler(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
                                        on_radio_availability);

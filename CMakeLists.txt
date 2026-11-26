@@ -31,10 +31,10 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(multimedia-service mm-service.cpp services.hpp demo-health.hpp mm-demo-health.hpp demo-modes.hpp radio-stations.cpp)
+add_executable(multimedia-service mm-service.cpp vsomeip-identity.hpp services.hpp demo-health.hpp mm-demo-health.hpp demo-modes.hpp radio-stations.cpp)
 target_link_libraries(multimedia-service  vsomeip3 ${Boost_LIBRARIES})
 
-add_executable(multimedia-client mm-client.cpp mm-video.cpp mm-video.hpp
+add_executable(multimedia-client mm-client.cpp mm-video.cpp mm-video.hpp vsomeip-identity.hpp
                mm-client-state.hpp demo-health.hpp demo-modes.hpp services.hpp
                sensors-protocol.hpp sensors-client-state.hpp)
 target_include_directories(multimedia-client PRIVATE ${CURSES_INCLUDE_DIRS} ${LIBCACA_INCLUDE_DIR})
@@ -42,21 +42,21 @@ target_compile_definitions(multimedia-client PRIVATE
     MM_DEFAULT_VIDEO_DIR=\"${CMAKE_INSTALL_FULL_DATADIR}/auto-apps/animations\")
 target_link_libraries(multimedia-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LIBRARIES} ${LIBCACA_LIBRARY})
 
-add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-memory.hpp demo-modes.hpp)
+add_executable(engine-service engine-service.cpp vsomeip-identity.hpp services.hpp demo-health.hpp engine-memory.hpp demo-modes.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
-add_executable(controller-service controller-service.cpp controller-systemd.hpp
+add_executable(controller-service controller-service.cpp vsomeip-identity.hpp controller-systemd.hpp
                controller-protocol.hpp demo-tuning.hpp services.hpp demo-health.hpp)
 target_link_libraries(controller-service vsomeip3 ${Boost_LIBRARIES})
 add_executable(controller-host-agent controller-host-agent.cpp controller-host-ipc.hpp
                controller-systemd.hpp controller-protocol.hpp)
 target_link_libraries(controller-host-agent pthread)
 
-add_executable(controller-qm-agent controller-qm-agent.cpp controller-systemd.hpp
+add_executable(controller-qm-agent controller-qm-agent.cpp vsomeip-identity.hpp controller-systemd.hpp
                controller-protocol.hpp services.hpp)
 target_link_libraries(controller-qm-agent vsomeip3 ${Boost_LIBRARIES})
 
-add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
+add_executable(sensors-service sensors-service.cpp vsomeip-identity.hpp sensors-simulation.cpp
                sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp
                sensors-health.hpp demo-health.hpp services.hpp)
 target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
@@ -67,8 +67,14 @@ install (
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
 
-# Agent-only vsomeip config is generated after QM networking is ready;
-# do not modify /etc/vsomeip.json used by other services.
+# Every application gets its stable SOME/IP client ID while retaining the
+# shared Unix-domain routingmanagerd IPC path.  The host/partition global
+# /etc/vsomeip.json is deliberately not overwritten.
+install(FILES config/vsomeip-ipc.json
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/auto-apps")
+
+# The native QM agent must not inherit the TCP-routing configuration from QM
+# /etc/vsomeip.json.  Generate an agent-only UDS config at each start.
 install(PROGRAMS tools/configure-qm-agent-vsomeip.py
         DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/auto-apps")
 
@@ -89,6 +95,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME qm-agent-config-test COMMAND ${Python3_EXECUTABLE}
                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-qm-agent-config.py)
+        add_test(NAME vsomeip-ipc-deployment-test COMMAND ${Python3_EXECUTABLE}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-vsomeip-ipc-deployment.py)
     endif()
     add_executable(controller-test tests/controller-test.cpp controller-protocol.hpp
                    controller-systemd.hpp controller-ui-state.hpp demo-tuning.hpp
