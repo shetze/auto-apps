@@ -25,6 +25,7 @@ using namespace std::literals::chrono_literals;
 #include "demo-health.hpp"
 #include "engine-memory.hpp"
 #include "demo-modes.hpp"
+#include "demo-tuning.hpp"
 
 namespace {
 
@@ -145,6 +146,9 @@ public:
             is_offered(false),
             mode_(demo_modes::EngineMode::Reverse),
             cycle_(std::chrono::steady_clock::now()),
+            tuning_({demo_cpu_duration_ms(),
+                     demo_tuning::to_mib(engine_demo::demo_ram_size_bytes()),
+                     demo_tuning::from_env("ENGINE_DEMO_HOLD_MUTEX", 0, 1), 0}),
             main_thread(std::bind(&engine_service::run, this)) {
     }
 
@@ -173,6 +177,10 @@ public:
                           std::placeholders::_1));
 
         std::set<vsomeip::eventgroup_t> its_groups;
+        app->register_message_handler(
+                ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, DEMO_TUNE_METHOD_ID,
+                std::bind(&engine_service::on_tune, this, std::placeholders::_1));
+
         its_groups.insert(ENGINE_EVENTGROUP_ID);
         app->offer_event(
                 ENGINE_SERVICE_ID,
@@ -309,12 +317,47 @@ public:
         app->send(response(request, actual));
     }
 
+    void on_tune(const std::shared_ptr<vsomeip::message> &request) {
+        controller::Command command;
+        auto payload = request->get_payload();
+        if (!payload || !controller::decode(payload->get_data(), payload->get_length(), command))
+            return;
+        if (command.target != controller::Target::Engine) return;
+        if (request->get_client() != CONTROLLER_SERVICE_ID) {
+            command.status = controller::Status::Denied;
+            auto reply = vsomeip::runtime::get()->create_response(request);
+            auto bytes = vsomeip::runtime::get()->create_payload();
+            bytes->set_data(controller::encode(command));
+            reply->set_payload(bytes);
+            app->send(reply);
+            return;
+        }
+        if (command.status == controller::Status::Unknown) {
+            command.value = tuning_.value(command.knob);
+            command.status = command.value == 0xffffffffu
+                    ? controller::Status::Unsupported : controller::Status::Ok;
+        } else if (command.status == controller::Status::Pending) {
+            command.status = controller::valid(command)
+                ? tuning_.apply(command.knob, command.value, main_thread.native_handle(),
+                    (std::getenv("AUTO_APPS_ALLOW_RT") != nullptr &&
+                     std::string(std::getenv("AUTO_APPS_ALLOW_RT")) == "1"))
+                : controller::Status::Invalid;
+            if (command.status == controller::Status::Ok)
+                main_condition.notify_all();
+        } else return;
+        auto reply = vsomeip::runtime::get()->create_response(request);
+        auto data = vsomeip::runtime::get()->create_payload();
+        data->set_data(controller::encode(command));
+        reply->set_payload(data);
+        app->send(reply);
+    }
+
     void run() {
-        const unsigned demo_cpu_ms = demo_cpu_duration_ms();
+        unsigned demo_cpu_ms = demo_cpu_duration_ms();
         const char *lock_env = std::getenv("ENGINE_DEMO_HOLD_MUTEX");
-        const bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
+        bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
                                    && lock_env[1] == '\0';
-        const std::uint64_t demo_ram_bytes = engine_demo::demo_ram_size_bytes();
+        std::uint64_t demo_ram_bytes = engine_demo::demo_ram_size_bytes();
         engine_demo::demo_ram_buffer ram_working_set;
         engine_demo::demo_ram_warning_state ram_warning;
         bool ram_allocation_failed = false;
@@ -372,6 +415,26 @@ public:
         };
 
         while (main_running) {
+            // Controller updates are sampled outside callbacks; RAM is
+            // reallocated immediately without changing the phase deadlines.
+            const auto settings = tuning_.read();
+            demo_cpu_ms = settings.cpu_ms;
+            demo_hold_mutex = settings.mutex != 0;
+            const std::uint64_t requested =
+                    std::uint64_t(settings.ram_mib) * 1024ULL * 1024ULL;
+            if (requested != demo_ram_bytes) {
+                demo_ram_bytes = requested;
+                health.ram_requested_bytes = requested;
+                if (!requested) {
+                    ram_working_set.release();
+                    health.ram_allocated_bytes = 0;
+                    health.ram_metrics_valid = true;
+                    health.ram = demo_health::Level::Normal;
+                    ram_allocation_failed = false;
+                }
+                prepared_generation = ~std::uint64_t{0};
+                publish_health(true);
+            }
             // Anchored monotonic transition deadlines, never reset after work.
             if (cycle_.advance(std::chrono::steady_clock::now())) {
                 mode_ = cycle_.mode();
@@ -498,6 +561,7 @@ private:
     bool reverse_announced_ = false;
     demo_modes::EngineMode announced_mode_ = demo_modes::EngineMode::Reverse;
 
+    demo_tuning::Runtime tuning_;
     // Start the worker only after state and synchronization are initialized.
     std::thread main_thread;
 };

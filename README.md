@@ -4,6 +4,24 @@ This directory contains a set of applications that demonstrate how
 typical automotive applications use SOME/IP to talk to each
 other. These apps work both natively and in a container.
 
+## Root controller / resource tuning
+
+`controller-service` now runs in the **AutoSD root partition**; a separate
+`controller-qm-agent` applies QM-local systemd resource changes. Use **`C`** in
+`multimedia-client` to open the live Controller monitor and **`T`** to enter
+its tuning mode. It shows QM and all three application service containers,
+including memory cap, CPUWeight, effective affinity, health age and live
+CPU/RAM/MUTEX/RT demo settings. Real cgroup changes are delegated to the
+correct systemd manager; synthetic workload changes use SOME/IP method
+`0x0008` with acknowledgements. See **[CONTROLLER.md](CONTROLLER.md)** for
+keyboard controls, deployment, security bounds and troubleshooting.
+
+The Controller is an **isolated demonstration feature, not a safety
+controller**; the AIB manifest explicitly enables the privileged tuning gate
+only for an assumed trusted demo network. RT scheduling is not automatically
+turned on. On real AutoSD builds, validate SELinux and service-manager
+permissions independently.
+
 ## The apps
 
 ### engine-service
@@ -71,7 +89,9 @@ an independent **1 Hz health heartbeat** (`0x8004`, eventgroup `0x4009`) using
 the same 48-byte `demo_health` protocol as Engine and Multimedia. The metrics
 come from the actual sensors worker thread (thread CPU time, elapsed time,
 frame deadline misses and retained camera payload buffer capacity); this is
-**not** a synthetic sensors CPU load or whole-process RSS. See below for the
+not whole-process RSS. An optional synthetic sensors CPU/RAM/MUTEX
+workload is now separately adjustable through the Controller; its default is
+zero, leaving the simulation workload unchanged. See below for the
 wire format, configuration and safety limitations.
 
 ### multimedia-client

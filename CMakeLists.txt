@@ -45,6 +45,13 @@ target_link_libraries(multimedia-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LI
 add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-memory.hpp demo-modes.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
+add_executable(controller-service controller-service.cpp controller-systemd.hpp
+               controller-protocol.hpp demo-tuning.hpp services.hpp demo-health.hpp)
+target_link_libraries(controller-service vsomeip3 ${Boost_LIBRARIES})
+add_executable(controller-qm-agent controller-qm-agent.cpp controller-systemd.hpp
+               controller-protocol.hpp services.hpp)
+target_link_libraries(controller-qm-agent vsomeip3 ${Boost_LIBRARIES})
+
 add_executable(sensors-service sensors-service.cpp sensors-simulation.cpp
                sensors-activation.hpp sensors-simulation.hpp sensors-protocol.hpp
                sensors-health.hpp demo-health.hpp services.hpp)
@@ -52,6 +59,7 @@ target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
 
 install (
     TARGETS multimedia-service multimedia-client engine-service sensors-service
+            controller-service controller-qm-agent
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
 
@@ -63,6 +71,12 @@ install(DIRECTORY animations/
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(controller-test tests/controller-test.cpp controller-protocol.hpp
+                   controller-systemd.hpp controller-ui-state.hpp demo-tuning.hpp
+                   fast-warning.hpp)
+    target_include_directories(controller-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(controller-test pthread)
+    add_test(NAME controller-test COMMAND controller-test)
     add_executable(demo-modes-test tests/demo-modes-test.cpp demo-modes.hpp
                    mm-client-state.hpp mm-demo-health.hpp)
     target_include_directories(demo-modes-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

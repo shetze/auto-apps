@@ -1,5 +1,7 @@
 #include "sensors-activation.hpp"
 #include "sensors-health.hpp"
+#include "demo-tuning.hpp"
+#include "engine-memory.hpp"
 #include "sensors-simulation.hpp"
 #include "services.hpp"
 
@@ -45,6 +47,16 @@ std::uint64_t worker_cpu_ns() {
            static_cast<std::uint64_t>(value.tv_nsec);
 }
 
+void cpu_demo_work(std::uint32_t budget_ms) {
+    const auto started = worker_cpu_ns();
+    volatile std::uint64_t value = 0x1234;
+    while (worker_cpu_ns() - started <
+           static_cast<std::uint64_t>(budget_ms) * 1000000ULL) {
+        for (unsigned i=0; i<2048; ++i)
+            value = (value * 1664525u + 1013904223u) ^ (value >> 7);
+    }
+}
+
 const char *status_name(sensors::CameraState state) {
     switch (state) {
     case sensors::CameraState::Active: return "ACTIVE";
@@ -58,7 +70,10 @@ const char *status_name(sensors::CameraState state) {
 class SensorsService {
 public:
     SensorsService()
-        : app_(vsomeip::runtime::get()->create_application("Sensors")) {
+        : app_(vsomeip::runtime::get()->create_application("Sensors")),
+          tuning_({demo_tuning::from_env("SENSORS_DEMO_CPU_MS", 0, 300),
+                   demo_tuning::from_env("SENSORS_DEMO_RAM_MIB", 0, 1024),
+                   demo_tuning::from_env("SENSORS_DEMO_HOLD_MUTEX", 0, 1), 0}) {
         config_.width = positive_env("SENSORS_CAMERA_WIDTH", 100,
                                      sensors::kMinCameraWidth, sensors::kMaxCameraWidth);
         config_.height = positive_env("SENSORS_CAMERA_HEIGHT", 30,
@@ -75,6 +90,34 @@ public:
             changed_ = true;
             cv_.notify_one();
         });
+        app_->register_message_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
+                DEMO_TUNE_METHOD_ID,
+                [this](const std::shared_ptr<vsomeip::message> &message) {
+                    controller::Command cmd;
+                    auto payload = message->get_payload();
+                    if (!payload || !controller::decode(payload->get_data(),
+                            payload->get_length(), cmd) ||
+                            cmd.target != controller::Target::Sensors) return;
+                    if (message->get_client() != CONTROLLER_SERVICE_ID) return;
+                    if (cmd.status == controller::Status::Unknown) {
+                        cmd.value = tuning_.value(cmd.knob);
+                        cmd.status = cmd.value == 0xffffffffu
+                            ? controller::Status::Unsupported : controller::Status::Ok;
+                    } else if (cmd.status == controller::Status::Pending) {
+                        cmd.status = controller::valid(cmd) &&
+                                     (cmd.knob != controller::Knob::DemoCpu || cmd.value <= 300)
+                            ? tuning_.apply(cmd.knob, cmd.value, worker_.native_handle(),
+                                (std::getenv("AUTO_APPS_ALLOW_RT") != nullptr &&
+                     std::string(std::getenv("AUTO_APPS_ALLOW_RT")) == "1"))
+                            : controller::Status::Invalid;
+                        cv_.notify_all();
+                    } else return;
+                    auto reply = vsomeip::runtime::get()->create_response(message);
+                    auto bytes = vsomeip::runtime::get()->create_payload();
+                    bytes->set_data(controller::encode(cmd));
+                    reply->set_payload(bytes);
+                    app_->send(reply);
+                });
         app_->register_availability_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                 [this](vsomeip::service_t, vsomeip::instance_t, bool available) {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -164,12 +207,27 @@ private:
         Clock::time_point next_status{};
         Clock::time_point next_health = Clock::now() + seconds(1);
         sensors_health::Tracker health_tracker(Clock::now(), worker_cpu_ns());
+        engine_demo::demo_ram_buffer working_set;
+        std::uint32_t prior_ram_mib = 0;
+        bool ram_failed = false;
+        Clock::time_point next_demo = Clock::now();
         sensors::Bytes frame_bytes; // retain the actual buffer across ticks
         Clock::time_point next_frame{};
         Clock::time_point next_ultrasonic{};
         const auto frame_period = nanoseconds(1000000000LL / config_.fps);
 
         while (running_.load()) {
+            const auto settings = tuning_.read();
+            if (settings.ram_mib != prior_ram_mib) {
+                const auto bytes = std::uint64_t(settings.ram_mib) * 1024ULL * 1024ULL;
+                std::string reason; std::uint64_t partial = 0;
+                lock.unlock();
+                const bool ok = working_set.acquire(bytes, reason, partial);
+                lock.lock();
+                prior_ram_mib = settings.ram_mib;
+                ram_failed = !ok;
+                if (!ok) std::cerr << "SENSORS: demo RAM unavailable: " << reason << '\n';
+            }
             const auto now = Clock::now();
             const auto epoch = activation_.epoch();
             const auto state = activation_.state();
@@ -201,8 +259,14 @@ private:
                 }
             }
             if (now >= next_health) {
-                health_bytes = demo_health::encode(health_tracker.sample(
-                        now, worker_cpu_ns(), frame_bytes.capacity()));
+                auto health = health_tracker.sample(now, worker_cpu_ns(),
+                        frame_bytes.capacity() + std::uint64_t(prior_ram_mib) * 1024ULL * 1024ULL);
+                health.ram_requested_bytes =
+                        std::uint64_t(settings.ram_mib) * 1024ULL * 1024ULL;
+                health.ram_allocated_bytes = frame_bytes.capacity() +
+                        (ram_failed ? 0 : health.ram_requested_bytes);
+                health.ram = ram_failed ? demo_health::Level::Failed : demo_health::Level::Normal;
+                health_bytes = demo_health::encode(health);
                 next_health = now + seconds(1);
             }
             auto deadline = std::min(next_status, next_health);
@@ -218,6 +282,15 @@ private:
             if (!frame_bytes.empty())
                 health_tracker.frame_finished(Clock::now() - frame_started, frame_period);
             lock.lock();
+            if (settings.cpu_ms > 0 && Clock::now() >= next_demo) {
+                // Spread the configured milliseconds per second over four
+                // 250ms slices; this is still a synthetic, non-real-time load.
+                if (!settings.mutex) lock.unlock();
+                cpu_demo_work(std::min<std::uint32_t>(settings.cpu_ms, 300) / 4);
+                if (!settings.mutex) lock.lock();
+                next_demo = Clock::now() + milliseconds(250);
+            }
+            if (settings.cpu_ms) deadline = std::min(deadline, next_demo);
             cv_.wait_until(lock, deadline,
                     [this] { return changed_ || !running_.load(); });
         }
@@ -229,6 +302,7 @@ private:
     }
 
     std::shared_ptr<vsomeip::application> app_;
+    demo_tuning::Runtime tuning_;
     sensors::SimulationConfig config_;
     sensors::Activation activation_;
     std::mutex mutex_;

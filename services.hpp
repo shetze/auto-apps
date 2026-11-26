@@ -1,5 +1,19 @@
 #include <vsomeip/vsomeip.hpp>
 #include <sstream>
+#include "controller-protocol.hpp"
+
+// Services accept a bounded runtime workload GET/SET method from controller.
+#define DEMO_TUNE_METHOD_ID 0x0008
+// Root controller exposes a read-only FIELD and a gated SET method.
+#define CONTROLLER_SERVICE_ID 0x1004
+#define CONTROLLER_INSTANCE_ID 1
+#define CONTROLLER_SET_METHOD_ID 0x0001
+#define CONTROLLER_EVENTGROUP_ID 0x4010
+#define CONTROLLER_STATUS_EVENT_ID 0x8010
+// QM-local systemd agent, never allowed to modify host/root units.
+#define CONTROLLER_AGENT_SERVICE_ID 0x1005
+#define CONTROLLER_AGENT_INSTANCE_ID 1
+#define CONTROLLER_AGENT_APPLY_METHOD_ID 0x0001
 
 #define RADIO_SERVICE_ID 0x1000
 #define RADIO_INSTANCE_ID 1

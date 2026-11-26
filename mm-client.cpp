@@ -33,6 +33,8 @@
 #include "services.hpp"
 #include "demo-health.hpp"
 #include "demo-modes.hpp"
+#include "controller-ui-state.hpp"
+#include "fast-warning.hpp"
 
 namespace {
 
@@ -56,6 +58,11 @@ std::mutex state_mutex;
 ClientState state;
 std::mutex sensors_mutex;
 sensors::ClientView sensor_view;
+std::mutex controller_mutex;
+controller::Snapshot controller_state;
+bool controller_online = false;
+bool controller_seen = false;
+std::chrono::steady_clock::time_point controller_received_at{};
 std::atomic<bool> running{true};
 
 // SOME/IP callbacks never call ncurses: the UI thread owns the terminal.
@@ -186,6 +193,53 @@ void on_engine_health_event(const std::shared_ptr<vsomeip::message> &event) {
     update_state([&](ClientState &s) { s.engine_health_event(message); });
 }
 
+void on_controller_availability(vsomeip::service_t, vsomeip::instance_t, bool online) {
+    std::lock_guard<std::mutex> lock(controller_mutex);
+    controller_online = online;
+}
+void on_controller_status(const std::shared_ptr<vsomeip::message> &msg) {
+    auto payload = msg->get_payload();
+    controller::Snapshot snapshot;
+    if (!payload || !controller::decode_snapshot(payload->get_data(), payload->get_length(), snapshot))
+        return;
+    std::lock_guard<std::mutex> lock(controller_mutex);
+    controller_state = snapshot;
+    controller_seen = true;
+    controller_received_at = std::chrono::steady_clock::now();
+}
+void on_controller_response(const std::shared_ptr<vsomeip::message> &msg) {
+    controller::Command answer;
+    auto payload = msg->get_payload();
+    if (!payload || !controller::decode(payload->get_data(), payload->get_length(), answer))
+        return;
+    std::lock_guard<std::mutex> lock(controller_mutex);
+    controller_state.last = answer;
+}
+void send_controller_tune(controller::Command cmd) {
+    auto request = vsomeip::runtime::get()->create_request();
+    request->set_service(CONTROLLER_SERVICE_ID);
+    request->set_instance(CONTROLLER_INSTANCE_ID);
+    request->set_method(CONTROLLER_SET_METHOD_ID);
+    auto payload = vsomeip::runtime::get()->create_payload();
+    payload->set_data(controller::encode(cmd));
+    request->set_payload(payload);
+    app->send(request);
+}
+void request_controller_events() {
+    app->register_availability_handler(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+                                       on_controller_availability);
+    app->register_message_handler(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+            CONTROLLER_STATUS_EVENT_ID, on_controller_status);
+    app->register_message_handler(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+            CONTROLLER_SET_METHOD_ID, on_controller_response);
+    app->request_event(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+            CONTROLLER_STATUS_EVENT_ID,
+            std::set<vsomeip::eventgroup_t>{CONTROLLER_EVENTGROUP_ID},
+            vsomeip::event_type_e::ET_FIELD);
+    app->subscribe(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID, CONTROLLER_EVENTGROUP_ID);
+    app->request_service(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID);
+}
+
 void request_radio_events() {
     app->register_message_handler(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
                                   RADIO_VOLUME_EVENT_ID, on_volume_message);
@@ -279,6 +333,7 @@ bool setup_vsomeip() {
     app->register_availability_handler(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID,
                                        on_sensor_availability);
     request_sensor_events();
+    request_controller_events();
     app->request_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
     app->request_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
     app->request_service(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID);
@@ -419,7 +474,7 @@ public:
         draw_volume(3, cols, s);
         draw_status(4, cols, s);
         draw_text(5, 1, content_width,
-                  "+/- Volume   SPACE Station   ESC Power   M Monitor   V Video   Q Quit", PairMuted);
+                  "+/- Volume  SPACE Station  ESC Power  M Monitor  V Video  C Controller  Q Quit", PairMuted);
         if (monitor)
             draw_monitor(s, sensor_view, parking_pending, rows, cols);
         refresh();
@@ -461,26 +516,21 @@ public:
         doupdate();
     }
 
-    // Static warning: no animation frames are decoded or advanced in Fast.
+    // Static, symmetric and exclusively English safety notice.
     void render_fast_warning(const ClientState &s, bool monitor, bool pending) {
         int rows = 0, cols = 0;
-        if (!begin_fullscreen(rows, cols))
-            return;
-        const int x = std::max(0, (cols - 66) / 2);
-        const int center = std::max(0, rows / 2 - 7);
-        video_line(center,     "============================================================", PairWarning, true, false, x);
-        video_line(center + 2, "       +---------------------------+", PairError, true, false, x);
-        video_line(center + 3, "       |       !!  FAST  !!       |", PairError, true, false, x);
-        video_line(center + 4, "       |    VIDEO DEAKTIVIERT     |", PairError, true, false, x);
-        video_line(center + 5, "       +---------------------------+", PairError, true, false, x);
-        video_line(center + 7, "SICHERHEITSHINWEIS / DRIVING SAFETY NOTICE", PairHeading, true, false, x);
-        video_line(center + 9, "Geschwindigkeitsbegrenzungen und Verkehrsregeln beachten!", PairWarning, true, false, x);
-        video_line(center + 10, "Blick auf die Strasse richten; keine Videos waehrend der Fahrt.", PairNormal, false, false, x);
-        video_line(center + 11, "Always follow speed limits and road-safety regulations.", PairNormal, false, false, x);
-        video_line(center + 13, "X / V  Videomodus verlassen   Q  Quit", PairMuted, false, false, x);
-        video_line(center + 14, "============================================================", PairWarning, true, false, x);
-        if (monitor)
-            video_line(0, parking_label(s, pending), PairMuted, true);
+        if (!begin_fullscreen(rows, cols)) return;
+        const auto lines = fast_warning::artwork();
+        const int width = static_cast<int>(lines.front().size());
+        const int left = std::max(0, (cols - width) / 2);
+        const int top = std::max(1, (rows - static_cast<int>(lines.size())) / 2);
+        for (std::size_t i = 0; i < lines.size() && top + static_cast<int>(i) < rows; ++i) {
+            const int color = i == 1 || i == 7 ? PairError :
+                              i == 8 || i == 9 ? PairWarning : PairHeading;
+            video_line(top + static_cast<int>(i), lines[i], color,
+                       i == 1 || i == 7 || i == 8, false, left);
+        }
+        if (monitor) video_line(0, parking_label(s, pending), PairMuted, true);
         wnoutrefresh(video_window_);
         doupdate();
     }
@@ -1036,6 +1086,99 @@ private:
                       "Sensors: actual worker CPU, camera frame buffers (not RSS); (demo) = metadata", PairMuted);
     }
 
+public:
+    void render_controller(const controller::Snapshot &view, bool online,
+                           bool fresh, bool tune_mode, std::size_t selected,
+                           bool editing, std::uint32_t proposed) const {
+        erase();
+        int height, width;
+        getmaxyx(stdscr, height, width);
+        if (width < 80 || height < 24) {
+            draw_text(0, 1, width - 2,
+                      "Controller requires a terminal of at least 80x24", PairWarning);
+            refresh(); return;
+        }
+        draw_text(0, 2, width - 4, "SYSTEM CONTROLLER / AUTOSD 10", PairHeading, true);
+        draw_text(1, 2, width - 4,
+                  std::string(online && fresh ? "CONNECTED" : "UNAVAILABLE / STALE") +
+                  "  |  QM RESOURCE GUARD  |  " +
+                  (view.tuning_enabled ? "TUNING ENABLED" : "TUNING LOCKED"),
+                  online && fresh ? PairGood : PairError);
+        draw_text(2, 2, width - 4,
+                  "C Close  T Toggle tuning  Arrows Select  +/- Change  Enter Apply  Esc Cancel", PairMuted);
+        const int xs[4] = {23, 37, 51, 65};
+        draw_text(4, 2, 20, "RESOURCE / STATUS", PairMuted);
+        for (unsigned j=0; j<4; ++j)
+            draw_text(4, xs[j], 13,
+                      controller::target_name(static_cast<controller::Target>(j)), PairHeading, true);
+        auto summary_line = [&](int line, const std::string &label,
+                                controller::Knob knob) {
+            draw_text(line, 2, 20, label, PairMuted);
+            for (unsigned j=0; j<4; ++j) {
+                const auto &n = view.nodes[j];
+                draw_text(line, xs[j], 13,
+                          controller_ui::format(knob, n.values[controller::index(knob)],
+                              static_cast<controller::Target>(j)));
+            }
+        };
+        summary_line(5, "Memory max", controller::Knob::MemoryMax);
+        summary_line(6, "CPUWeight", controller::Knob::CpuWeight);
+        summary_line(7, "Allowed CPUs", controller::Knob::Affinity);
+        draw_text(8, 2, 18, "Health / events", PairMuted);
+        for (unsigned j=0; j<4; ++j) {
+            const auto &n = view.nodes[j];
+            const char *name = !n.available ? "OFFLINE" :
+                n.health == 4 ? "STALE" : n.health == 3 ? "FAILED" :
+                n.health == 2 ? "DEGRADED" : n.health == 1 ? "NORMAL" : "WAITING";
+            draw_text(8, xs[j], 13, name, n.health >= 2 ? PairWarning : PairGood);
+        }
+        draw_text(9, 2, 18, "Health age", PairMuted);
+        for (unsigned j=0; j<4; ++j) {
+            const auto age = view.nodes[j].age_ms;
+            const auto text = age == 0xffffffffu ? "--" :
+                    std::to_string(age / 1000u) + "." +
+                    std::to_string((age % 1000u) / 100u) + "s";
+            draw_text(9, xs[j], 13, text);
+        }
+        summary_line(10, "Demo CPU ms", controller::Knob::DemoCpu);
+        summary_line(11, "Demo RAM MiB", controller::Knob::DemoRam);
+        summary_line(12, "Demo mutex", controller::Knob::DemoMutex);
+        summary_line(13, "RT priority", controller::Knob::RtPriority);
+        draw_text(15, 2, width - 4,
+                  std::string("LIVE TUNING  ") + (tune_mode ? "[EDIT]" : "[VIEW]") +
+                  "  (CPU/RAM/MUTEX = synthetic; RT needs CAP_SYS_NICE)",
+                  tune_mode ? PairWarning : PairMuted);
+        const auto &items = controller_ui::rows();
+        const int visible = std::max(1, height - 20);
+        const int first = std::max(0, static_cast<int>(selected) - visible/2);
+        const int last = std::min(static_cast<int>(items.size()), first + visible);
+        for (int i = first; i < last; ++i) {
+            const auto &r = items[i];
+            const auto current = controller_ui::current(view, r);
+            const auto is_selected = static_cast<std::size_t>(i) == selected;
+            const auto value = is_selected && editing ? proposed : current;
+            const auto label = std::string(controller::target_name(r.target)) + " / " +
+                               controller::knob_name(r.knob);
+            draw_text(i - first + 16, 2, 39, (is_selected ? "> " : "  ") + label,
+                      is_selected ? PairHeading : PairMuted, is_selected);
+            draw_text(i - first + 16, 43, 23,
+                      controller_ui::format(r.knob, value, r.target),
+                      is_selected && editing ? PairWarning : PairNormal,
+                      is_selected);
+        }
+        const auto &last_cmd = view.last;
+        draw_text(height - 3, 2, width - 4,
+                  std::string("Last: ") + controller::target_name(last_cmd.target) +
+                  " / " + controller::knob_name(last_cmd.knob) +
+                  " / " + controller::status_name(last_cmd.status),
+                  last_cmd.status == controller::Status::Ok ? PairGood : PairWarning);
+        draw_text(height - 2, 2, width - 4,
+                  "Automatic QM load reductions: " + std::to_string(view.automatic) +
+                  "  |  Limits protect the root/QM boundary", PairMuted);
+        refresh();
+    }
+
+private:
     WINDOW *video_window_ = nullptr;
     int video_rows_ = 0;
     int video_cols_ = 0;
@@ -1111,6 +1254,13 @@ int main() {
         });
 
         bool monitor_visible = false;
+        bool controller_visible = false;
+        bool controller_tuning = false;
+        bool controller_editing = false;
+        std::size_t controller_selected = 0;
+        std::uint32_t controller_proposed = 0;
+        std::uint32_t controller_serial = 0;
+        std::uint32_t controller_rendered_sequence = 0;
         bool parking_pending = false;
         bool parking_target = false;
         auto parking_request_at = std::chrono::steady_clock::time_point{};
@@ -1142,7 +1292,8 @@ int main() {
                     before_input.direction == Direction::Reverse && !before_input.mode_stale,
                     monitor_visible, video_visible);
             const bool fast_before_input = before_input.fast_or_last_known_fast();
-            terminal.set_input_timeout(camera_before_input ? kCameraRefreshMs :
+            terminal.set_input_timeout(controller_visible ? kRefreshMs :
+                    camera_before_input ? kCameraRefreshMs :
                     (video_visible && !fast_before_input
                      ? video.wait_ms(std::chrono::steady_clock::now()) : kRefreshMs));
             wint_t key = 0;
@@ -1151,6 +1302,51 @@ int main() {
                 redraw = true;
             } else if (result == OK && (key == L'q' || key == L'Q')) {
                 running.store(false);
+            } else if (result == OK && (key == L'c' || key == L'C')) {
+                controller_visible = !controller_visible;
+                controller_editing = false;
+                redraw = true;
+            } else if (controller_visible) {
+                controller::Snapshot ctrl;
+                { std::lock_guard<std::mutex> lock(controller_mutex); ctrl = controller_state; }
+                const auto &items = controller_ui::rows();
+                if (result == OK && (key == L't' || key == L'T')) {
+                    controller_tuning = !controller_tuning && ctrl.tuning_enabled;
+                    controller_editing = false; redraw = true;
+                } else if ((result == KEY_CODE_YES && key == KEY_UP) ||
+                           (result == OK && key == L'k')) {
+                    if (controller_selected) --controller_selected;
+                    controller_editing = false; redraw = true;
+                } else if ((result == KEY_CODE_YES && key == KEY_DOWN) ||
+                           (result == OK && key == L'j')) {
+                    controller_selected = std::min(items.size() - 1, controller_selected + 1);
+                    controller_editing = false; redraw = true;
+                } else if (result == OK && key == 27) {
+                    if (controller_editing) controller_editing = false;
+                    else controller_visible = false;
+                    redraw = true;
+                } else if (result == OK && controller_tuning &&
+                        (key == L'+' || key == L'-')) {
+                    const auto row = items[controller_selected];
+                    if (!controller_editing) {
+                        controller_proposed = controller_ui::current(ctrl, row);
+                        controller_editing = true;
+                    }
+                    controller_proposed = controller_ui::adjust(row, controller_proposed,
+                                                            key == L'+' ? 1 : -1);
+                    redraw = true;
+                } else if (result == OK && controller_tuning && controller_editing &&
+                           (key == L'\n' || key == L'\r')) {
+                    const auto row = items[controller_selected];
+                    controller::Command cmd;
+                    cmd.serial = ++controller_serial;
+                    cmd.target = row.target;
+                    cmd.knob = row.knob;
+                    cmd.value = controller_proposed;
+                    cmd.status = controller::Status::Pending;
+                    if (controller::valid(cmd)) send_controller_tune(cmd);
+                    controller_editing = false; redraw = true;
+                }
             } else if (result == OK && (key == L'p' || key == L'P') && monitor_visible) {
                 // The authoritative setting is an Engine FIELD; never update
                 // the display optimistically before the Engine acknowledges it.
@@ -1250,7 +1446,7 @@ int main() {
                     snapshot.direction == Direction::Reverse && !snapshot.mode_stale,
                     monitor_visible, video_visible);
             const bool fast_warning = snapshot.fast_or_last_known_fast() && video_visible;
-            const bool overlay_visible = camera_visible || fast_warning;
+            const bool overlay_visible = camera_visible || fast_warning || controller_visible;
             if (overlay_visible != overlay_was_visible) {
                 if (overlay_visible)
                     video.pause(now);
@@ -1261,9 +1457,9 @@ int main() {
             }
             // The multimedia service only burns the full CPU budget when an
             // actual moving image is on screen. A warning or library is idle.
-            const bool moving_media = (camera_visible &&
+            const bool moving_media = !controller_visible && ((camera_visible &&
                     sensor_snapshot.fresh_frame(now) != nullptr) ||
-                    (video_visible && video.playing() && !overlay_visible);
+                    (video_visible && video.playing() && !overlay_visible));
             if (snapshot.radio.availability == Availability::Available &&
                 (moving_media != last_media_active ||
                  now - last_media_report >= std::chrono::seconds(1))) {
@@ -1272,7 +1468,25 @@ int main() {
                 last_media_active = moving_media;
                 last_media_report = now;
             }
-            if (fast_warning) {
+            if (controller_visible) {
+                controller::Snapshot ctrl;
+                bool online, fresh;
+                {
+                    std::lock_guard<std::mutex> lock(controller_mutex);
+                    ctrl = controller_state;
+                    online = controller_online;
+                    fresh = controller_seen &&
+                        now - controller_received_at <= std::chrono::seconds(4);
+                }
+                if (redraw || now - last_rendered >= std::chrono::seconds(1) ||
+                    ctrl.sequence != controller_rendered_sequence) {
+                    terminal.render_controller(ctrl, online, fresh,
+                        controller_tuning, controller_selected,
+                        controller_editing, controller_proposed);
+                    controller_rendered_sequence = ctrl.sequence;
+                    last_rendered = now; redraw = false;
+                }
+            } else if (fast_warning) {
                 if (redraw) {
                     terminal.render_fast_warning(snapshot, monitor_visible, parking_pending);
                     redraw = false;
@@ -1329,6 +1543,11 @@ int main() {
                            SENSORS_CAMERA_STATUS_EVENT_ID, SENSORS_HEALTH_EVENT_ID})
             app->release_event(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID, event);
         app->release_service(SENSORS_SERVICE_ID, SENSORS_INSTANCE_ID);
+        app->unsubscribe(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+                         CONTROLLER_EVENTGROUP_ID);
+        app->release_event(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID,
+                           CONTROLLER_STATUS_EVENT_ID);
+        app->release_service(CONTROLLER_SERVICE_ID, CONTROLLER_INSTANCE_ID);
 
     } // Restore the terminal before the original DLT shutdown workaround.
     std::fflush(nullptr);

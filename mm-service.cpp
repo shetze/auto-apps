@@ -30,6 +30,7 @@ using namespace std::literals::chrono_literals;
 #include "radio-stations.hpp"
 #include "mm-demo-health.hpp"
 #include "demo-modes.hpp"
+#include "demo-tuning.hpp"
 
 namespace {
 
@@ -456,6 +457,9 @@ public:
             volume_policy_(50),
             next_radio_station(0),
             next_playing(false),
+            tuning_({demo_cpu_duration_ms(),
+                     demo_tuning::to_mib(demo_ram_size_bytes()),
+                     demo_tuning::from_env("RADIO_DEMO_HOLD_MUTEX", 0, 1), 0}),
             main_thread(std::bind(&radio_service::run, this)) {
     }
 
@@ -467,6 +471,9 @@ public:
             return false;
         }
 
+        app->register_message_handler(
+                RADIO_SERVICE_ID, RADIO_INSTANCE_ID, DEMO_TUNE_METHOD_ID,
+                std::bind(&radio_service::on_tune, this, std::placeholders::_1));
         app->register_message_handler(
                 RADIO_SERVICE_ID,
                 RADIO_INSTANCE_ID,
@@ -604,6 +611,41 @@ public:
         app->stop_offer_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
     }
 
+    void on_tune(const std::shared_ptr<vsomeip::message> &request) {
+        controller::Command command;
+        auto payload = request->get_payload();
+        if (!payload || !controller::decode(payload->get_data(), payload->get_length(), command))
+            return;
+        if (command.target != controller::Target::Multimedia) return;
+        if (request->get_client() != CONTROLLER_SERVICE_ID) {
+            command.status = controller::Status::Denied;
+            auto reply = vsomeip::runtime::get()->create_response(request);
+            auto bytes = vsomeip::runtime::get()->create_payload();
+            bytes->set_data(controller::encode(command));
+            reply->set_payload(bytes);
+            app->send(reply);
+            return;
+        }
+        if (command.status == controller::Status::Unknown) {
+            command.value = tuning_.value(command.knob);
+            command.status = command.value == 0xffffffffu
+                    ? controller::Status::Unsupported : controller::Status::Ok;
+        } else if (command.status == controller::Status::Pending) {
+            command.status = controller::valid(command)
+                ? tuning_.apply(command.knob, command.value, main_thread.native_handle(),
+                    (std::getenv("AUTO_APPS_ALLOW_RT") != nullptr &&
+                     std::string(std::getenv("AUTO_APPS_ALLOW_RT")) == "1"))
+                : controller::Status::Invalid;
+            if (command.status == controller::Status::Ok)
+                main_condition.notify_all();
+        } else return;
+        auto reply = vsomeip::runtime::get()->create_response(request);
+        auto data = vsomeip::runtime::get()->create_payload();
+        data->set_data(controller::encode(command));
+        reply->set_payload(data);
+        app->send(reply);
+    }
+
     void run() {
         // Always publish the first effective volume as a SOME/IP field.
         uint32_t current_volume = std::numeric_limits<std::uint32_t>::max();
@@ -613,14 +655,14 @@ public:
         uint32_t current_song = 0;
         bool goto_next_song = true;
         std::chrono::time_point<std::chrono::system_clock> next_song_at;
-        const unsigned demo_cpu_ms = demo_cpu_duration_ms();
+        unsigned demo_cpu_ms = demo_cpu_duration_ms();
         const char *lock_env = std::getenv("RADIO_DEMO_HOLD_MUTEX");
-        const bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
+        bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
                                    && lock_env[1] == '\0';
         unsigned garbage_level = 0;
         bool garbage_level_changed = false;
         demo_cpu_metrics demo_metrics;
-        const std::uint64_t demo_ram_bytes = demo_ram_size_bytes();
+        std::uint64_t demo_ram_bytes = demo_ram_size_bytes();
         demo_ram_buffer ram_working_set;
         demo_ram_warning_state ram_warning;
         bool ram_warning_displayed = false;
@@ -676,6 +718,22 @@ public:
         publish_health(true);
 
         while (main_running) {
+            const auto settings = tuning_.read();
+            demo_cpu_ms = settings.cpu_ms;
+            demo_hold_mutex = settings.mutex != 0;
+            const std::uint64_t new_ram_bytes =
+                    std::uint64_t(settings.ram_mib) * 1024ULL * 1024ULL;
+            if (new_ram_bytes != demo_ram_bytes) {
+                demo_ram_bytes = new_ram_bytes;
+                health_tracker.set_ram_requested(new_ram_bytes);
+                if (!new_ram_bytes) {
+                    ram_working_set.release();
+                    health_tracker.record_ram_allocation(true, 0, false);
+                } else if (next_playing) {
+                    goto_next_song = true;
+                }
+                publish_health(true);
+            }
             bool display = false;
             bool station_changed = false;
             // An orphaned Fast heartbeat must not hold the boosted volume
@@ -1131,6 +1189,7 @@ private:
     bool media_active_ = false;
     std::chrono::steady_clock::time_point media_reported_at_{};
 
+    demo_tuning::Runtime tuning_;
     // Start the worker only after all state and synchronization are initialized.
     std::thread main_thread;
 };

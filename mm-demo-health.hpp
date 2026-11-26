@@ -66,6 +66,10 @@ public:
         return {cpu_ms, wall_ms, off_ms, share, deadline_ms, overrun_ms};
     }
 
+    void set_ram_requested(std::uint64_t bytes) {
+        health_.ram_requested_bytes = bytes;
+    }
+
     // Update RAM accounting after a new song's allocation attempt. A failure
     // increments the cumulative counter; the caller owns the 15-second hold.
     void record_ram_allocation(bool acquired, std::uint64_t allocated_bytes,
