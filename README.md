@@ -4,23 +4,24 @@ This directory contains a set of applications that demonstrate how
 typical automotive applications use SOME/IP to talk to each
 other. These apps work both natively and in a container.
 
-## Root controller / resource tuning
+## Controller / resource tuning (AutoSD 10)
 
-`controller-service` now runs in the **AutoSD root partition**; a separate
-`controller-qm-agent` applies QM-local systemd resource changes. Use **`C`** in
-`multimedia-client` to open the live Controller monitor and **`T`** to enter
-its tuning mode. It shows QM and all three application service containers,
-including memory cap, CPUWeight, effective affinity, health age and live
-CPU/RAM/MUTEX/RT demo settings. Real cgroup changes are delegated to the
-correct systemd manager; synthetic workload changes use SOME/IP method
-`0x0008` with acknowledgements. See **[CONTROLLER.md](CONTROLLER.md)** for
-keyboard controls, deployment, security bounds and troubleshooting.
+The SOME/IP `controller-service` runs as a **Root `ipc_t` Podman container**, in
+parallel with Engine and Sensors. The restricted native
+`controller-host-agent` exposes only fixed, bounded systemd resource operations
+through a private Unix socket; it never participates in SOME/IP. The native
+`controller-qm-agent` reads and updates Multimedia container resources in the
+QM systemd manager. Its agent-specific vsomeip configuration is generated at
+startup from the **current QM IP address** without altering the shared
+`/etc/vsomeip.json`.
 
-The Controller is an **isolated demonstration feature, not a safety
-controller**; the AIB manifest explicitly enables the privileged tuning gate
-only for an assumed trusted demo network. RT scheduling is not automatically
-turned on. On real AutoSD builds, validate SELinux and service-manager
-permissions independently.
+Press **`C`** in `multimedia-client` to open the Controller; **`T`** enters
+interactive tuning. Per-knob read status now distinguishes unknown, denied,
+offline, and timed-out values; `CPUWeight=idle` and default weights are
+represented correctly. Rebuild both Controller and Multimedia client together:
+the status snapshot wire format changed to `ATC2`. See
+**[CONTROLLER.md](CONTROLLER.md)** for deployment, key bindings, safety and
+verification. The Controller is a **demonstrator, not a safety controller**.
 
 ## The apps
 

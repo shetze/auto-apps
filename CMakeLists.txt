@@ -48,6 +48,10 @@ target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 add_executable(controller-service controller-service.cpp controller-systemd.hpp
                controller-protocol.hpp demo-tuning.hpp services.hpp demo-health.hpp)
 target_link_libraries(controller-service vsomeip3 ${Boost_LIBRARIES})
+add_executable(controller-host-agent controller-host-agent.cpp controller-host-ipc.hpp
+               controller-systemd.hpp controller-protocol.hpp)
+target_link_libraries(controller-host-agent pthread)
+
 add_executable(controller-qm-agent controller-qm-agent.cpp controller-systemd.hpp
                controller-protocol.hpp services.hpp)
 target_link_libraries(controller-qm-agent vsomeip3 ${Boost_LIBRARIES})
@@ -59,9 +63,14 @@ target_link_libraries(sensors-service vsomeip3 ${Boost_LIBRARIES})
 
 install (
     TARGETS multimedia-service multimedia-client engine-service sensors-service
-            controller-service controller-qm-agent
+            controller-service controller-qm-agent controller-host-agent
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
+
+# Agent-only vsomeip config is generated after QM networking is ready;
+# do not modify /etc/vsomeip.json used by other services.
+install(PROGRAMS tools/configure-qm-agent-vsomeip.py
+        DESTINATION "${CMAKE_INSTALL_LIBEXECDIR}/auto-apps")
 
 # Pack an immediately playable 100x30/10fps sample into RPM and container.
 install(DIRECTORY animations/
@@ -71,6 +80,16 @@ install(DIRECTORY animations/
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(controller-host-ipc-test tests/controller-host-ipc-test.cpp
+                   controller-host-ipc.hpp controller-protocol.hpp)
+    target_include_directories(controller-host-ipc-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(controller-host-ipc-test pthread)
+    add_test(NAME controller-host-ipc-test COMMAND controller-host-ipc-test)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME qm-agent-config-test COMMAND ${Python3_EXECUTABLE}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-qm-agent-config.py)
+    endif()
     add_executable(controller-test tests/controller-test.cpp controller-protocol.hpp
                    controller-systemd.hpp controller-ui-state.hpp demo-tuning.hpp
                    fast-warning.hpp)

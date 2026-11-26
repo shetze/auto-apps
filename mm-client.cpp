@@ -1117,8 +1117,9 @@ public:
             for (unsigned j=0; j<4; ++j) {
                 const auto &n = view.nodes[j];
                 draw_text(line, xs[j], 13,
-                          controller_ui::format(knob, n.values[controller::index(knob)],
-                              static_cast<controller::Target>(j)));
+                          controller_ui::with_status(knob, n.values[controller::index(knob)],
+                              static_cast<controller::Target>(j),
+                              n.statuses[controller::index(knob)]));
             }
         };
         summary_line(5, "Memory max", controller::Knob::MemoryMax);
@@ -1162,7 +1163,10 @@ public:
             draw_text(i - first + 16, 2, 39, (is_selected ? "> " : "  ") + label,
                       is_selected ? PairHeading : PairMuted, is_selected);
             draw_text(i - first + 16, 43, 23,
-                      controller_ui::format(r.knob, value, r.target),
+                      is_selected && editing ? controller_ui::format(r.knob, value, r.target) :
+                        controller_ui::with_status(r.knob, value, r.target,
+                            view.nodes[static_cast<unsigned>(r.target)].statuses[
+                                controller::index(r.knob)]),
                       is_selected && editing ? PairWarning : PairNormal,
                       is_selected);
         }
@@ -1329,6 +1333,14 @@ int main() {
                         (key == L'+' || key == L'-')) {
                     const auto row = items[controller_selected];
                     if (!controller_editing) {
+                        const auto &node = ctrl.nodes[static_cast<unsigned>(row.target)];
+                        if (node.statuses[controller::index(row.knob)] != controller::Status::Ok ||
+                            node.values[controller::index(row.knob)] == 0xffffffffu) {
+                            // Unknown resource values must not be converted into an
+                            // accidental unsafe initial limit (e.g. QM 20%).
+                            redraw = true;
+                            continue;
+                        }
                         controller_proposed = controller_ui::current(ctrl, row);
                         controller_editing = true;
                     }

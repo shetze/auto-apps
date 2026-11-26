@@ -19,7 +19,7 @@ enum class Knob : std::uint32_t {
 };
 enum class Status : std::uint32_t {
     Ok = 0, Invalid = 1, Unavailable = 2, Denied = 3, Failed = 4,
-    Pending = 5, Unsupported = 6, Unknown = 7
+    Pending = 5, Unsupported = 6, Unknown = 7, Timeout = 8
 };
 // value: QM MemoryMax is a percentage (never >40); per-service MemoryMax
 // and DemoRam are MiB; Affinity is CPU mask bits 0..31, 0 means inherited.
@@ -51,7 +51,7 @@ inline Bytes encode(const Command &c) {
 inline bool decode(const std::uint8_t *p, std::size_t n, Command &c) {
     if (!p || n != 28 || get(p) != kMagic || get(p + 4) != kVersion ||
         get(p + 12) > 3 || get(p + 16) < 1 || get(p + 16) > 7 ||
-        get(p + 24) > 7) return false;
+        get(p + 24) > 8) return false;
     c.serial = get(p + 8); c.target = static_cast<Target>(get(p + 12));
     c.knob = static_cast<Knob>(get(p + 16)); c.value = get(p + 20);
     c.status = static_cast<Status>(get(p + 24));
@@ -80,6 +80,11 @@ struct Node {
     std::array<std::uint32_t, 7> values{{0xffffffffu, 0xffffffffu, 0xffffffffu,
                                          0xffffffffu, 0xffffffffu, 0xffffffffu,
                                          0xffffffffu}};
+    // Status of each individual knob. Unknown until first read; Timeout for
+    // an unanswered GET, Unavailable for an unreachable provider.
+    std::array<Status, 7> statuses{{Status::Unknown, Status::Unknown,
+           Status::Unknown, Status::Unknown, Status::Unknown,
+           Status::Unknown, Status::Unknown}};
 };
 struct Snapshot {
     std::uint32_t sequence = 0;
@@ -88,13 +93,17 @@ struct Snapshot {
     std::uint32_t automatic = 0; // successful auto intervention count
     std::uint32_t tuning_enabled = 0;
 };
-constexpr std::size_t kSnapshotBytes = 8 + kNodeCount * 40 + 28 + 8;
+// Snapshot v2 adds per-knob diagnostics without changing the 28-byte
+// command wire format used by individual service tuning methods.
+constexpr std::uint32_t kSnapshotMagic = 0x41544332u; // ATC2
+constexpr std::size_t kSnapshotBytes = 8 + kNodeCount * 68 + 28 + 8;
 inline Bytes encode(const Snapshot &s) {
     Bytes b; b.reserve(kSnapshotBytes);
-    put(b, kMagic); put(b, s.sequence);
+    put(b, kSnapshotMagic); put(b, s.sequence);
     for (const auto &n : s.nodes) {
         put(b, n.available); put(b, n.health); put(b, n.age_ms);
         for (auto v : n.values) put(b, v);
+        for (auto status : n.statuses) put(b, static_cast<std::uint32_t>(status));
     }
     const auto last = encode(s.last);
     b.insert(b.end(), last.begin(), last.end());
@@ -102,7 +111,7 @@ inline Bytes encode(const Snapshot &s) {
     return b;
 }
 inline bool decode_snapshot(const std::uint8_t *p, std::size_t size, Snapshot &s) {
-    if (!p || size != kSnapshotBytes || get(p) != kMagic) return false;
+    if (!p || size != kSnapshotBytes || get(p) != kSnapshotMagic) return false;
     Snapshot parsed;
     parsed.sequence = get(p + 4);
     std::size_t pos = 8;
@@ -112,6 +121,11 @@ inline bool decode_snapshot(const std::uint8_t *p, std::size_t size, Snapshot &s
         n.age_ms = get(p + pos); pos += 4;
         if (n.available > 1 || n.health > 4) return false;
         for (auto &v : n.values) { v = get(p + pos); pos += 4; }
+        for (auto &status : n.statuses) {
+            const auto raw = get(p + pos); pos += 4;
+            if (raw > static_cast<std::uint32_t>(Status::Timeout)) return false;
+            status = static_cast<Status>(raw);
+        }
     }
     if (!decode(p + pos, 28, parsed.last)) return false;
     pos += 28;
@@ -151,6 +165,7 @@ inline const char *status_name(Status s) {
     case Status::Pending: return "PENDING";
     case Status::Unsupported: return "UNSUPPORTED";
     case Status::Unknown: return "UNKNOWN";
+    case Status::Timeout: return "TIMEOUT";
     }
     return "UNKNOWN";
 }

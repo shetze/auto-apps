@@ -1,144 +1,166 @@
-# Auto Apps controller demonstrator (AutoSD 10)
+# Auto Apps Controller – root/QM integration (AutoSD 10 demonstrator)
 
-## Partition design
+## What changed
 
-- `controller-service` is a **native systemd service in the AutoSD root
-  partition**, installed at `/usr/bin/controller-service` and enabled by
-  `auto-apps.aib.yml` (`auto-apps-controller.service`). It is not embedded in QM.
-- `controller-qm-agent` is a **native service in QM's own systemd instance**, not
-  an application container. It can only operate on the single allowlisted
-  `multimedia.service` unit in QM. The root controller handles `qm.service`,
-  `engine.service`, and `sensors.service` via the root systemd manager.
-- Engine and Sensors Quadlets in the supplied manifest reside in the root
-  partition; Multimedia is inside QM. This is the actual manifest deployment,
-  not a guessed layout.
-- The controller observes Engine, Multimedia and Sensors over their existing
-  health SOME/IP fields. It never parses the terminal or journal for health.
-- The QM agent and controller use additional SOME/IP interfaces over the
-  existing routing-manager socket. No arbitrary unit names, filesystem paths,
-  or shell commands are accepted from a client.
+The AutoSD root-partition Controller must participate in SOME/IP as a Podman
+**`ipc_t` container** (like Engine). It cannot run `systemctl` against the host
+because the host systemd private socket and system bus are not inside the
+container. The previous native controller unit and direct `systemctl` calls
+were therefore not suitable for this deployment.
 
-AutoSD has a distinct systemd manager within the QM container. A root-only
-`systemctl set-property multimedia.service` would target the wrong unit. This
-agent explicitly avoids that mistake.
+The image now contains three distinct components:
 
-## User interface
+| Component | Where it runs | Role |
+| --- | --- | --- |
+| `controller.service` | Root Podman Quadlet, `SecurityLabelType=ipc_t` | SOME/IP health/status, UI, bounded tuning orchestration |
+| `auto-apps-controller-host-agent.service` | Native root systemd | Inspect and adjust `qm.service`, `engine.service`, `sensors.service` cgroups |
+| `auto-apps-qm-agent.service` | Native QM systemd | Inspect and adjust `multimedia.service` inside QM |
 
-Open the controller with **`C`** from radio, monitor, video or Fast. It is a
-static screen, and interrupts moving-image presentation/CPU-boost leases just
-like other overlays. `C` closes it and returns to the previous mode.
+The native host agent does **not** join SOME/IP. The root controller and host
+agent communicate via an **AF_UNIX SOCK_SEQPACKET** socket at
+`/run/ipc/auto-apps-controller/host.sock`. Only the controller container has
+this host-directory bind mount (read-only). The host agent checks peer UID,
+accepts only fixed-size versioned 28-byte commands, and only allows the three
+fixed Root units and the three cgroup knobs. It never executes arbitrary
+commands or accepts arbitrary paths from SOME/IP. `systemctl` is executed
+without a shell.
 
-The header shows QM / Engine / Multimedia / Sensors side by side, including
-live `MemoryMax`, `CPUWeight`, `AllowedCPUs` (effective cgroup CPU mask,
-maximum 32 CPUs), service health and age, and all current synthetic
-CPU/RAM/MUTEX/RT settings. Below it, a scrollable list presents:
+> **Not a safety controller.** This is a closed-network functional and resource
+> interference demonstration, not certified FFI or protection against a
+> malicious controller or routing-manager participant. SOME/IP client IDs are
+> *not* authentication. Runtime changes to cgroup controls and RT settings
+> require additional authorization and validation on the target platform.
 
-| Setting | QM | Per-service | Change at runtime |
-| --- | --- | --- | --- |
-| `MemoryMax` | 20–40% of host RAM | 0=inherited or 64–4096 MiB | `systemctl set-property --runtime` |
-| `CPUWeight` | 1–100, default 100 | 1–10000 | `systemctl set-property --runtime` |
-| `AllowedCPUs` | CPU mask subset | CPU mask subset | `systemctl set-property --runtime` |
-| Synthetic CPU | not applicable | 0–2000 ms (Sensors 0–300 ms) | immediate SOME/IP setting |
-| Synthetic RAM | not applicable | 0–1024 MiB | reallocate in worker loop |
-| Demo mutex | not applicable | free / held | immediate SOME/IP setting |
-| RT priority | not applicable | SCHED_OTHER or FIFO 1–5 | `pthread_setschedparam` on worker |
+## QM networking
 
-The controller view requires a terminal at least **80×24** characters.
-Use **`T`** to enable/disable local tuning, **Up/Down** to select a setting,
-**`+/-`** to change the proposed value, and **Enter** to apply it. `Esc`
-cancels a proposed change or exits the controller. The server publishes the
-actual result (`APPLIED`, `PENDING`, `DENIED`, `OFFLINE`, `FAILED`). No optimistic
-assumption is made when systemd or a service does not acknowledge the change.
+Your observed QM partition uses `eth0=10.88.0.3/16`, while the Root routing
+manager is `10.88.0.1:31000`. Binding a QM guest socket to `10.88.0.1` fails
+with `EADDRNOTAVAIL (99)`.
 
-The RPM and AIB configure the controller as a root-native systemd service;
-there is deliberately no privileged host mount inside a QM application.
+The QM-agent unit now runs this preflight before launch:
 
-## Safety and privilege limitations
-
-**DEMONSTRATOR ONLY. NOT SUITABLE AS A SAFETY CONTROLLER.** Do not deploy this
-interactive tuner in a real road vehicle or claim it provides Freedom from
-Interference. SOME/IP client IDs (`0x1002` multimedia UI and `0x1004`
-controller) are routing identifiers, **not cryptographic authentication**.
-A compromised QM client or routing configuration must not be trusted to
-operate a privileged controller. The supplied AIB opt-in
-`AUTO_APPS_CONTROLLER_TUNING=1` is intended only for a closed test network.
-Disable the setting or run the controller without it for **read-only** use.
-For production, implement authenticated authorization on an isolated control
-plane, privilege separation, audited changes and policy-certified safeguards.
-
-The QM `MemoryMax` controller cannot increase above the manifest's **40%**
-ceiling. For any finite memory cap, the controller additionally rejects a
-change if current cgroup usage would leave less than 128 MiB of headroom.
-Limits are clamped, systemd commands are built from fixed allowlisted tokens,
-and invoked by `execv`, never via a shell. No custom command or unit path can
-be sent. Affinity can only be reduced to a subset of the currently effective
-CPU set (or reset to inheritance). Cgroup changes use systemd runtime
-properties and are non-persistent; an image reboot restores AIB defaults.
-
-The controller **never automatically changes the Engine or root partition
-resource budget**. An optional, conservative demo rule halves only the
-*synthetic* Multimedia CPU workload after five consecutively degraded/failed
-CPU-health samples, no more than once per minute. It does not alter the QM
-partition boundary, real camera hardware, or the engine driving state.
-
-RT priority starts at SCHED_OTHER / 0. Enabling SCHED_FIFO is denied unless
-`AUTO_APPS_ALLOW_RT=1` is explicitly set for that particular service and the
-worker is authorized by the OS (`CAP_SYS_NICE` and an appropriate RT limit).
-RT scheduling is **not automatically enabled** in this image. Applying the
-setting without those privileges produces `DENIED`, not a success indicator.
-The 1–5 priority bound does not itself make scheduling safe under contention;
-validate privileges and the Linux RT throttling policy on the actual hardware.
-
-The root controller and QM agent require appropriate permissions to access
-SOME/IP and the respective systemd managers. In SELinux enforcing mode, check
-actual AVCs and adjust the site's policy narrowly. This patch does **not**
-grant arbitrary SELinux access or disable enforcing mode.
-
-## SOME/IP endpoints
-
-| Application | Client ID | Service / instance | Operations |
-| --- | --- | --- | --- |
-| Controller | `0x1004` | `0x1004 / 0x0001` | `0x0001` tune, `0x8010` status (`0x4010`) |
-| Controller QM Agent | `0x1005` | `0x1005 / 0x0001` | `0x0001` cgroup QM-local apply/get |
-| Engine, Multimedia, Sensors | unchanged | existing IDs `0x1001`, `0x1000`, `0x1003` | `0x0008` demo knob set/get |
-
-Controller commands are fixed **28-byte** big-endian records with magic
-`ATC1`, version, request serial, target, setting, value and status. Snapshot
-fields use `ATC1`, a sequence, fixed slots for four nodes, last action,
-automatic intervention count and tuning gate. Unknown numeric values are
-`0xffffffff`. The decoder rejects malformed lengths and invalid enums.
-`status=UNKNOWN` represents a GET; `PENDING` requests a SET; status changes
-are applied only after actual acknowledgements. The status FIELD is sent
-once per second with `_force=true` so unchanged snapshots do not become stale.
-
-## Running and checking on AutoSD
-
-After building the RPM, rebuild and boot the image from `auto-apps.aib.yml`.
-A tarball overlay on the project tree **does not** install systemd units into
-an already deployed image. The image builder must be rerun, or the units
-installed/enabled separately on a development system.
-
-```bash
-# root-partition manager
-systemctl status auto-apps-controller.service qm.service engine.service sensors.service
-systemctl show qm.service -p MemoryMax -p CPUWeight -p ControlGroup
-journalctl -u auto-apps-controller.service -b --no-pager
-
-# inside the QM partition, using its own systemd session
-systemctl status auto-apps-qm-agent.service multimedia.service
-systemctl show multimedia.service -p MemoryMax -p CPUWeight -p ControlGroup
-journalctl -u auto-apps-qm-agent.service -b --no-pager
-
-# review privilege / SELinux diagnostics if unavailable
-ausearch -m AVC -ts recent
+```text
+/usr/bin/python3 /usr/libexec/auto-apps/configure-qm-agent-vsomeip.py
+  --input /etc/vsomeip.json
+  --output /run/auto-apps-qm-agent/vsomeip.json
 ```
 
-AutoSD's QM shell/access mechanism depends on the target image. Do not run
-the QM-specific `systemctl` commands in the root manager: they name different
-units. Use an actual QM shell or service-management transport such as BlueChi.
+It determines the **current** QM source IPv4 address using the kernel route to
+the routing manager, checks that address can be bound locally, and creates an
+**agent-only** configuration. `routing.host.unicast` remains the Root routing
+manager; `routing.guests.unicast` becomes the QM-local address. If a top-level
+`unicast` exists it is also changed to the local address. Application IDs,
+services, port ranges and the original `/etc/vsomeip.json` are not changed.
 
-The controller's live systemd access and inter-partition SOME/IP routing have
-**not** been tested on an AutoSD target in this delivery. Syntax and protocol
-unit tests use local replacements for unavailable vsomeip development headers;
-verify the RPM build, AIB image creation, root/QM permission model, set-property
-outcomes, UI keys, automatic backoff and RT failure/success paths on the target.
+The agent uses `VSOMEIP_CONFIGURATION=/run/auto-apps-qm-agent/vsomeip.json`.
+The file is regenerated on **each QM-agent start**, so an address change does
+not require manually editing a static IP or restarting unrelated applications.
+If no valid local route exists, preflight fails explicitly and systemd retries.
+
+## Controller display
+
+`C` opens/closes the Controller view. `T` enables editing (if the deployment
+tuning gate is enabled); Up/Down chooses a knob, `+/-` changes a proposal,
+Enter submits it, and Esc cancels. Nothing is treated as successfully applied
+until an acknowledgement arrives.
+
+The v2 Controller status snapshot (`ATC2`) now carries a separate read status
+for **each of the seven settings on each of four nodes**. It displays:
+
+- A measured value if available (`APPLIED`/OK, e.g. `QM CPUWeight: idle`);
+- `default (100)` for unset systemd `CPUWeight`; `idle` for `CPUWeight=idle`;
+- `unlimited` for `MemoryMax=infinity`;
+- `-- (OFFLINE)`, `-- (TIMEOUT)`, `-- (DENIED)`, `-- (N/A)`,
+  `-- (PENDING)` or `-- (UNKNOWN)` as appropriate;
+- `n/a` for synthetic workload knobs on the QM partition.
+
+Engine/Multimedia/Sensors synthetic CPU/RAM/MUTEX/RT values are still read via
+`DEMO_TUNE_METHOD_ID` over SOME/IP. Each GET now has its own request serial,
+4-second deadline and status. Reordered/stale responses are ignored. Failed
+GETs and timeouts can therefore be diagnosed without confusing them with zero
+values. The client must be rebuilt together with the Controller because the
+snapshot wire format changes from ATC1 to ATC2. The individual tuning command
+format remains ATC1 (version 1) and the service IDs remain unchanged.
+
+Unknown read values cannot be edited; this avoids applying arbitrary default
+limits (such as decreasing QM memory to 20%) when monitoring is unavailable.
+
+## Supported runtime operations
+
+| Knob | Root host agent | QM agent | Service SOME/IP |
+| --- | --- | --- | --- |
+| `MemoryMax` | QM, Engine, Sensors | Multimedia | — |
+| `CPUWeight` | QM, Engine, Sensors | Multimedia | — |
+| Effective CPU affinity / `AllowedCPUs` | QM, Engine, Sensors | Multimedia | — |
+| Synthetic CPU, RAM, mutex | — | — | Engine, Multimedia, Sensors |
+| RT thread priority | — | — | Engine, Multimedia, Sensors |
+
+QM memory tuning is bounded to 20–40% of host RAM and cannot raise the
+configured 40% ceiling. Per-service memory caps are 0 (unlimited) or 64–4096
+MiB and require 128 MiB headroom before tightening a finite cap. CPU affinity
+is restricted to the effective parent set and a 32-CPU protocol mask. The
+existing conservative QM-only synthetic CPU mitigation is retained.
+`SCHED_FIFO` requires service-specific opt-in and appropriate kernel privileges.
+
+Both the Container Controller (`AUTO_APPS_CONTROLLER_TUNING=1`) and native Host
+agent (`AUTO_APPS_HOST_AGENT_TUNING=1`) are enabled in the supplied demo AIB
+manifest. For read-only deployments, disable **both** gates, plus any QM-side
+write authorization. Neither gate replaces proper authentication.
+
+## Deployment / verification
+
+The changed AIB manifest and RPM must be rebuilt into the AutoSD image. **Do
+not hand-edit shared QM `/etc/vsomeip.json` or restart all services just to
+fix the QM-agent address.** A project overlay does not update a running image.
+
+New image (Root context):
+
+```sh
+systemctl status controller.service auto-apps-controller-host-agent.service
+systemctl status qm.service engine.service sensors.service
+ls -ldZ /run/ipc/auto-apps-controller
+ls -lZ /run/ipc/auto-apps-controller/host.sock
+journalctl -b -u auto-apps-controller-host-agent.service -u controller.service --no-pager
+podman ps --format '{{.Names}} {{.Status}}'
+```
+
+New image (inside **QM** systemd namespace):
+
+```sh
+systemctl status auto-apps-qm-agent.service
+journalctl -b -u auto-apps-qm-agent.service --no-pager -n 100
+python3 -c 'import json; d=json.load(open("/run/auto-apps-qm-agent/vsomeip.json")); print(d["routing"])'
+ip -br -4 addr
+systemctl show multimedia.service -p MemoryMax -p CPUWeight -p ControlGroup
+```
+
+The QM-agent journal should print the selected guest address; on the observed
+VM it should be `10.88.0.3`. Root routing host remains `10.88.0.1`. There
+should no longer be `Cannot bind to client port 31493` errors. If it does
+bind but still cannot register, inspect routing-manager logs and SELinux AVCs.
+
+On an **existing** image with the former native controller unit, stop and
+disable `auto-apps-controller.service` before switching to the Quadlet-based
+`controller.service`. Never run both applications with client ID `0x1004`.
+The rebuilt AIB image does not install the obsolete native unit.
+
+SELinux is kept enforcing by the manifest. The new Unix socket is deliberately
+private and no host systemd D-Bus socket is mounted inside the Controller
+container. On a real AutoSD target, verify that the `ipc_t` Controller is
+allowed to connect to the host agent's socket; if AVCs occur, grant only the
+required socket `connectto` and path permissions, not general systemd access.
+The precise site-specific labels and policy transition cannot be validated in
+the current build environment. Rootful Podman with host UID 0 is expected;
+rootless or remapped UIDs fail the Host agent's peer check.
+
+## Tests and known limits
+
+This change adds tests for the versioned controller status/CPUWeight decoding,
+Host-agent Unix socket protocol and QM isolated configuration generation. The
+previous demo modes, health, and sensors unit tests are unchanged.
+
+**Target validation still required:** Build against real `vsomeip3-devel`,
+check Quadlet generation and SELinux rules on AutoSD 10, ensure the QM agent
+registers on the local IP, and test actual `systemctl set-property` and
+`CAP_SYS_NICE` outcomes. Static syntax tests with a stub are not equivalent
+to a target integration test.

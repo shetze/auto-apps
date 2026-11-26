@@ -33,6 +33,7 @@ inline std::uint32_t current(const controller::Snapshot &s, Row row) {
 }
 inline std::uint32_t adjust(Row row, std::uint32_t value, int dir) {
     if (value == 0xffffffffu) value = 0;
+    if (row.knob == controller::Knob::CpuWeight && value == 0xfffffffeu) value = 100;
     if (row.knob == controller::Knob::DemoMutex) return value ? 0u : 1u;
     if (row.knob == controller::Knob::Affinity) {
         // Bit patterns: inherited => CPU0 => CPUs0-1 => 0-3 => 0-7 => 0-15.
@@ -65,6 +66,10 @@ inline std::uint32_t adjust(Row row, std::uint32_t value, int dir) {
 inline std::string format(controller::Knob knob, std::uint32_t value,
                           controller::Target target) {
     if (value == 0xffffffffu) return "--";
+    if (knob == controller::Knob::CpuWeight) {
+        if (value == 0) return "idle";
+        if (value == 0xfffffffeu) return "default (100)";
+    }
     if (knob == controller::Knob::MemoryMax) {
         if (target == controller::Target::Qm) return std::to_string(value) + "%";
         return value ? std::to_string(value) + " MiB" : "unlimited";
@@ -78,5 +83,17 @@ inline std::string format(controller::Knob knob, std::uint32_t value,
     if (knob == controller::Knob::RtPriority) return value ?
             "FIFO " + std::to_string(value) : "SCHED_OTHER";
     return std::to_string(value);
+}
+} // namespace controller_ui
+
+namespace controller_ui {
+inline std::string with_status(controller::Knob knob, std::uint32_t value,
+                               controller::Target target, controller::Status status) {
+    if (target == controller::Target::Qm && controller::index(knob) >= 3) return "n/a";
+    if (status == controller::Status::Ok) return format(knob, value, target);
+    if (status == controller::Status::Pending) return "-- (PENDING)";
+    if (status == controller::Status::Unknown) return "-- (UNKNOWN)";
+    if (status == controller::Status::Unsupported) return "-- (N/A)";
+    return "-- (" + std::string(controller::status_name(status)) + ")";
 }
 } // namespace controller_ui

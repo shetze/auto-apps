@@ -55,14 +55,14 @@ install -m 0644 auto-apps.pp %{buildroot}%{_datadir}/selinux/packages/automotive
 /usr/sbin/semodule -i %{_datadir}/selinux/packages/automotive/auto-apps.pp &> /dev/null || :
 
 # 2. Apply file contexts to affected directories/files
-/usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/multimedia-client %{_bindir}/multimedia-service %{_bindir}/sensors-service %{_bindir}/controller-service %{_bindir}/controller-qm-agent &> /dev/null || :
+/usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/multimedia-client %{_bindir}/multimedia-service %{_bindir}/sensors-service %{_bindir}/controller-service %{_bindir}/controller-qm-agent %{_bindir}/controller-host-agent &> /dev/null || :
 
 %postun selinux
 if [ $1 -eq 0 ]; then
     # If the package is completely uninstalled: remove module
     /usr/sbin/semodule -r auto-apps &> /dev/null || :
     # Reset context to default
-    /usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/multimedia-client %{_bindir}/multimedia-service %{_bindir}/sensors-service %{_bindir}/controller-service %{_bindir}/controller-qm-agent &> /dev/null || :
+    /usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/multimedia-client %{_bindir}/multimedia-service %{_bindir}/sensors-service %{_bindir}/controller-service %{_bindir}/controller-qm-agent %{_bindir}/controller-host-agent &> /dev/null || :
 fi
 
 %files
@@ -72,6 +72,8 @@ fi
 %{_bindir}/sensors-service
 %{_bindir}/controller-service
 %{_bindir}/controller-qm-agent
+%{_bindir}/controller-host-agent
+%{_libexecdir}/auto-apps/configure-qm-agent-vsomeip.py
 %{_datadir}/auto-apps/animations/
 
 %files selinux

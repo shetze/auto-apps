@@ -6,7 +6,7 @@
 // controller or a substitute for certified FFI mechanisms.
 #include "services.hpp"
 #include "demo-health.hpp"
-#include "controller-systemd.hpp"
+#include "controller-host-ipc.hpp"
 #include <vsomeip/vsomeip.hpp>
 #include <array>
 #include <atomic>
@@ -32,15 +32,6 @@ constexpr std::array<vsomeip::event_t, 4> health_events{{0, ENGINE_HEALTH_EVENT_
 constexpr std::array<vsomeip::eventgroup_t, 4> health_groups{{0, ENGINE_HEALTH_EVENTGROUP_ID,
                                                                RADIO_HEALTH_EVENTGROUP_ID,
                                                                SENSORS_HEALTH_EVENTGROUP_ID}};
-const char *unit_name(controller::Target t) {
-    switch (t) {
-    case controller::Target::Qm: return "qm.service";
-    case controller::Target::Engine: return "engine.service";
-    case controller::Target::Multimedia: return "multimedia.service";
-    case controller::Target::Sensors: return "sensors.service";
-    }
-    return "";
-}
 class Controller {
 public:
     Controller()
@@ -75,7 +66,14 @@ public:
                     [this,i](vsomeip::service_t, vsomeip::instance_t, bool available) {
                         std::lock_guard<std::mutex> lock(mutex_);
                         state_.nodes[i].available = available ? 1u : 0u;
-                        if (!available) state_.nodes[i].health = 4;
+                        if (!available) {
+                    state_.nodes[i].health = 4;
+                    for (unsigned k=3; k<7; ++k) {
+                        state_.nodes[i].statuses[k] = controller::Status::Unavailable;
+                        state_.nodes[i].values[k] = 0xffffffffu;
+                        pending_serial_[i][k] = 0;
+                    }
+                }
                         cv_.notify_all();
                     });
             app_->register_message_handler(ids[i], 1, health_events[i],
@@ -96,6 +94,13 @@ public:
                 [this](vsomeip::service_t, vsomeip::instance_t, bool value) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     agent_online_ = value;
+                    if (!value) {
+                        for (unsigned k=0; k<3; ++k) {
+                            state_.nodes[2].statuses[k] = controller::Status::Unavailable;
+                            state_.nodes[2].values[k] = 0xffffffffu;
+                            pending_serial_[2][k] = 0;
+                        }
+                    }
                     cv_.notify_all();
                 });
         app_->register_message_handler(CONTROLLER_AGENT_SERVICE_ID, 1,
@@ -140,7 +145,7 @@ private:
             const auto now = Clock::now();
             if (enabled_ && degraded_streak_ >= 5 &&
                 now >= next_auto_ &&
-                node.values[controller::index(controller::Knob::DemoCpu)] != 0xffffffffu &&
+                node.statuses[controller::index(controller::Knob::DemoCpu)] == controller::Status::Ok &&
                 node.values[controller::index(controller::Knob::DemoCpu)] >= 20) {
                 controller::Command command;
                 command.serial = 0x80000000u | (++auto_serial_ & 0x7fffffffu);
@@ -188,13 +193,31 @@ private:
         controller::Command cmd;
         auto p = msg->get_payload();
         if (!p || !controller::decode(p->get_data(), p->get_length(), cmd)) return;
+        const auto target = static_cast<unsigned>(cmd.target);
+        if (target == 0 || target >= state_.nodes.size()) return;
+        const bool qm_cgroup = target == 2 && controller::index(cmd.knob) < 3;
+        const vsomeip::service_t expected = qm_cgroup ? CONTROLLER_AGENT_SERVICE_ID : ids[target];
+        if (msg->get_service() != expected) return;
+        const unsigned key = controller::index(cmd.knob);
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto index = static_cast<unsigned>(cmd.target);
-        if (cmd.status == controller::Status::Ok && index < state_.nodes.size())
-            state_.nodes[index].values[controller::index(cmd.knob)] = cmd.value;
+        if ((cmd.serial & 0xc0000000u) == 0x40000000u) { // GET serial
+            if (pending_serial_[target][key] != cmd.serial) return;
+            pending_serial_[target][key] = 0;
+            state_.nodes[target].statuses[key] = cmd.status;
+            state_.nodes[target].values[key] = cmd.status == controller::Status::Ok
+                                                ? cmd.value : 0xffffffffu;
+            if (cmd.status != controller::Status::Ok)
+                std::cerr << "CONTROLLER: GET " << controller::target_name(cmd.target)
+                          << "/" << controller::knob_name(cmd.knob) << " => "
+                          << controller::status_name(cmd.status) << '\n';
+            return;
+        }
+        if (cmd.status == controller::Status::Ok) {
+            state_.nodes[target].values[key] = cmd.value;
+            state_.nodes[target].statuses[key] = controller::Status::Ok;
+        }
         if (cmd.serial != 0) {
-            // Ignore out-of-order completions of obsolete commands.
-            if ((cmd.serial & 0x80000000u) != 0 && cmd.status == controller::Status::Ok)
+            if ((cmd.serial & 0x80000000u) && cmd.status == controller::Status::Ok)
                 ++state_.automatic;
             if (state_.last.serial == cmd.serial)
                 state_.last = cmd;
@@ -220,29 +243,24 @@ private:
         app_->send(req);
     }
     void process(controller::Command cmd) {
-        if (cmd.target == controller::Target::Multimedia &&
-             (cmd.knob == controller::Knob::MemoryMax ||
-              cmd.knob == controller::Knob::CpuWeight ||
-              cmd.knob == controller::Knob::Affinity)) {
+        const auto key = controller::index(cmd.knob);
+        if (cmd.target == controller::Target::Multimedia && key < 3) {
             bool agent;
             { std::lock_guard<std::mutex> lock(mutex_); agent = agent_online_; }
             if (agent) { emit(cmd); return; }
             cmd.status = controller::Status::Unavailable;
-        } else if (cmd.knob == controller::Knob::MemoryMax ||
-                   cmd.knob == controller::Knob::CpuWeight ||
-                   cmd.knob == controller::Knob::Affinity) {
-            cmd.status = controller_systemd::apply(unit_name(cmd.target), cmd,
-                                                  cmd.target == controller::Target::Qm);
+        } else if (key < 3) {
+            // No host systemd bus is mounted in the ipc_t container.
+            // The native host agent alone is permitted to read / mutate units.
+            controller::Command result;
+            cmd.status = controller_host_ipc::request(cmd, result)
+                       ? result.status : controller::Status::Unavailable;
             if (cmd.status == controller::Status::Ok) {
-                controller::Node fresh;
-                if (controller_systemd::inspect(unit_name(cmd.target), fresh,
-                            cmd.target == controller::Target::Qm)) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    auto &node = state_.nodes[static_cast<unsigned>(cmd.target)];
-                    for (unsigned i=0; i<3; ++i) node.values[i] = fresh.values[i];
-                    if (cmd.target == controller::Target::Qm)
-                        node.available = fresh.available;
-                }
+                cmd.value = result.value; // report the actually applied value
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto &node = state_.nodes[static_cast<unsigned>(cmd.target)];
+                node.values[key] = cmd.value;
+                node.statuses[key] = controller::Status::Ok;
             }
         } else {
             const auto index = static_cast<unsigned>(cmd.target);
@@ -257,48 +275,72 @@ private:
                 state_.last = cmd;
         }
     }
-    void poll_systemd() {
-        for (auto t : {controller::Target::Qm, controller::Target::Engine,
-                       controller::Target::Sensors}) {
-            controller::Node fresh;
-            const bool success = controller_systemd::inspect(unit_name(t), fresh,
-                                                          t == controller::Target::Qm);
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto &node = state_.nodes[static_cast<unsigned>(t)];
-            if (success) {
-                for (unsigned k=0; k<3; ++k) node.values[k] = fresh.values[k];
-                if (t == controller::Target::Qm) {
-                    node.available = fresh.available;
-                    node.health = fresh.available ? 1u : 4u;
-                    node.age_ms = 0;
-                }
-            } else if (t == controller::Target::Qm) {
-                node.available = 0;
-                node.health = 4;
-                node.age_ms = 0xffffffffu;
+    void poll_root_resources() {
+        for (const auto t : {controller::Target::Qm, controller::Target::Engine,
+                             controller::Target::Sensors}) {
+            bool any_ok = false;
+            for (unsigned key=1; key<=3; ++key) {
+                controller::Command query;
+                query.target = t;
+                query.knob = static_cast<controller::Knob>(key);
+                query.status = controller::Status::Unknown;
+                controller::Command reply;
+                const bool connected = controller_host_ipc::request(query, reply);
+                const auto status = connected ? reply.status : controller::Status::Unavailable;
+                auto &node = state_.nodes[static_cast<unsigned>(t)];
+                std::lock_guard<std::mutex> lock(mutex_);
+                node.values[key-1] = status == controller::Status::Ok ? reply.value : 0xffffffffu;
+                node.statuses[key-1] = status;
+                any_ok |= status == controller::Status::Ok;
+            }
+            if (t == controller::Target::Qm) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto &node = state_.nodes[0];
+                node.available = any_ok;
+                node.health = any_ok ? 1u : 4u;
+                node.age_ms = any_ok ? 0u : 0xffffffffu;
             }
         }
+    }
+    void poll_remote_values() {
+        // Real SOME/IP GET requests. Give each request a serial and deadline;
+        // a missing or negative reply becomes visible instead of permanent --.
         for (unsigned target=1; target<4; ++target) {
-            for (unsigned key=4; key<=7; ++key) {
-                controller::Command cmd;
-                cmd.target = static_cast<controller::Target>(target);
-                cmd.knob = static_cast<controller::Knob>(key);
-                cmd.status = controller::Status::Unknown;
-                bool online;
-                { std::lock_guard<std::mutex> lock(mutex_);
-                  online = state_.nodes[target].available != 0; }
-                if (online) emit(cmd);
+            for (unsigned key=4; key<=7; ++key)
+                poll_one(static_cast<controller::Target>(target),
+                         static_cast<controller::Knob>(key));
+        }
+        for (unsigned key=1; key<=3; ++key)
+            poll_one(controller::Target::Multimedia,
+                     static_cast<controller::Knob>(key));
+    }
+    void poll_one(controller::Target target, controller::Knob knob) {
+        const unsigned idx = static_cast<unsigned>(target), key = controller::index(knob);
+        controller::Command cmd;
+        cmd.target = target;
+        cmd.knob = knob;
+        cmd.status = controller::Status::Unknown;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const bool online = key < 3 ? agent_online_ : state_.nodes[idx].available != 0;
+            if (!online) {
+                state_.nodes[idx].values[key] = 0xffffffffu;
+                state_.nodes[idx].statuses[key] = controller::Status::Unavailable;
+                pending_serial_[idx][key] = 0;
+                return;
             }
+            if (pending_serial_[idx][key] != 0) return;
+            // 0x40000000 disambiguates probe responses from writes (0x8...).
+            cmd.serial = 0x40000000u | (++next_probe_serial_ & 0x3fffffffu);
+            pending_serial_[idx][key] = cmd.serial;
+            poll_pending_at_[idx][key] = Clock::now();
+            state_.nodes[idx].statuses[key] = controller::Status::Pending;
         }
-        bool agent;
-        { std::lock_guard<std::mutex> lock(mutex_); agent = agent_online_; }
-        if (agent) for (unsigned key=1; key<=3; ++key) {
-            controller::Command cmd;
-            cmd.target = controller::Target::Multimedia;
-            cmd.knob = static_cast<controller::Knob>(key);
-            cmd.status = controller::Status::Unknown;
-            emit(cmd);
-        }
+        emit(cmd);
+    }
+    void poll_systemd() {
+        poll_root_resources();
+        poll_remote_values();
     }
     void observe_systemd() {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -336,6 +378,18 @@ private:
                 node.age_ms = static_cast<std::uint32_t>(std::min<std::int64_t>(age, 0xfffffffeLL));
                 if (age > 4000 || !node.available) node.health = 4;
             }
+            for (unsigned t=1; t<4; ++t) for (unsigned k=0; k<7; ++k) {
+                if (pending_serial_[t][k] &&
+                    now - poll_pending_at_[t][k] >= std::chrono::seconds(4)) {
+                    pending_serial_[t][k] = 0;
+                    state_.nodes[t].values[k] = 0xffffffffu;
+                    state_.nodes[t].statuses[k] = controller::Status::Timeout;
+                    std::cerr << "CONTROLLER: GET "
+                              << controller::target_name(static_cast<controller::Target>(t))
+                              << "/" << controller::knob_name(static_cast<controller::Knob>(k+1))
+                              << " => TIMEOUT\n";
+                }
+            }
             state_.sequence++;
             auto data = controller::encode(state_);
             lock.unlock();
@@ -361,6 +415,9 @@ private:
     Clock::time_point next_auto_{};
     unsigned auto_serial_ = 0;
     unsigned degraded_streak_ = 0;
+    unsigned next_probe_serial_ = 0;
+    std::array<std::array<std::uint32_t,7>,4> pending_serial_{};
+    std::array<std::array<Clock::time_point,7>,4> poll_pending_at_{};
 };
 } // namespace
 int main() {

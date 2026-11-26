@@ -124,6 +124,15 @@ inline std::string file_text(const std::string &path) {
     std::getline(in, val);
     return val;
 }
+// systemctl can return special string values which must not be shown as
+// missing. 0=idle, 0xfffffffe=inherited kernel default 100.
+inline std::uint32_t cpu_weight(const std::string &s) {
+    if (s == "idle") return 0;
+    if (s == "[not set]" || s.empty()) return 0xfffffffeu;
+    std::uint64_t n;
+    return parse_uint(s, n) && n >= 1 && n <= 10000
+            ? static_cast<std::uint32_t>(n) : 0xffffffffu;
+}
 inline bool inspect(const std::string &unit, controller::Node &node,
                     bool qm_partition = false) {
     if (!is_unit(unit)) return false;
@@ -139,9 +148,9 @@ inline bool inspect(const std::string &unit, controller::Node &node,
                     (val / 1024ULL * 100ULL + (host / 1024ULL) / 2ULL) / (host / 1024ULL)));
         } else node.values[0] = static_cast<std::uint32_t>(std::min<std::uint64_t>(0xfffffffeULL,
                 val / (1024ULL * 1024ULL)));
-    } else node.values[0] = 0; // no cap (infinity)
-    if (parse_uint(line_value(result.output, "CPUWeight"), val))
-        node.values[1] = static_cast<std::uint32_t>(val);
+    } else if (line_value(result.output, "MemoryMax") == "infinity")
+        node.values[0] = 0; // no cap (infinity)
+    node.values[1] = cpu_weight(line_value(result.output, "CPUWeight"));
     const auto group = line_value(result.output, "ControlGroup");
     if (cg_path(group)) {
         const auto cpu_list = file_text("/sys/fs/cgroup" + group + "/cpuset.cpus.effective");
