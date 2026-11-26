@@ -45,14 +45,14 @@ target_link_libraries(multimedia-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LI
 add_executable(engine-service engine-service.cpp vsomeip-identity.hpp services.hpp demo-health.hpp engine-memory.hpp demo-modes.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
-add_executable(controller-service controller-service.cpp vsomeip-identity.hpp controller-systemd.hpp
+add_executable(controller-service controller-service.cpp controller-auto-policy.hpp vsomeip-identity.hpp controller-systemd.hpp
                controller-protocol.hpp demo-tuning.hpp services.hpp demo-health.hpp)
 target_link_libraries(controller-service vsomeip3 ${Boost_LIBRARIES})
-add_executable(controller-host-agent controller-host-agent.cpp controller-host-ipc.hpp
+add_executable(controller-host-agent controller-host-agent.cpp controller-agent-scope.hpp controller-host-ipc.hpp
                controller-systemd.hpp controller-protocol.hpp)
 target_link_libraries(controller-host-agent pthread)
 
-add_executable(controller-qm-agent controller-qm-agent.cpp vsomeip-identity.hpp controller-systemd.hpp
+add_executable(controller-qm-agent controller-qm-agent.cpp vsomeip-identity.hpp controller-host-ipc.hpp
                controller-protocol.hpp services.hpp)
 target_link_libraries(controller-qm-agent vsomeip3 ${Boost_LIBRARIES})
 
@@ -86,6 +86,10 @@ install(DIRECTORY animations/
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(controller-auto-policy-test tests/controller-auto-policy-test.cpp
+                   controller-auto-policy.hpp demo-health.hpp)
+    target_include_directories(controller-auto-policy-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME controller-auto-policy-test COMMAND controller-auto-policy-test)
     add_executable(controller-host-ipc-test tests/controller-host-ipc-test.cpp
                    controller-host-ipc.hpp controller-protocol.hpp)
     target_include_directories(controller-host-ipc-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -98,7 +102,7 @@ if(BUILD_TESTING)
         add_test(NAME vsomeip-ipc-deployment-test COMMAND ${Python3_EXECUTABLE}
                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-vsomeip-ipc-deployment.py)
     endif()
-    add_executable(controller-test tests/controller-test.cpp controller-protocol.hpp
+    add_executable(controller-test tests/controller-test.cpp controller-agent-scope.hpp controller-protocol.hpp
                    controller-systemd.hpp controller-ui-state.hpp demo-tuning.hpp
                    fast-warning.hpp)
     target_include_directories(controller-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

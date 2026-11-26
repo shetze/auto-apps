@@ -64,7 +64,8 @@ inline bool valid(const Command &c) {
     switch (k) {
     case Knob::MemoryMax:
         return t == Target::Qm ? v >= 20 && v <= 40 : v == 0 || (v >= 64 && v <= 4096);
-    case Knob::CpuWeight: return v >= 1 && v <= 10000 && (t != Target::Qm || v <= 100);
+    // 0 is the systemd special value CPUWeight=idle, below numeric 1.
+    case Knob::CpuWeight: return v <= 10000 && (t != Target::Qm || v <= 100);
     case Knob::Affinity: return true; // checked against available cpuset on host
     case Knob::DemoCpu: return t != Target::Qm && v <= (t == Target::Sensors ? 300u : 2000u);
     case Knob::DemoRam: return t != Target::Qm && v <= 1024;
@@ -92,11 +93,20 @@ struct Snapshot {
     Command last{};
     std::uint32_t automatic = 0; // successful auto intervention count
     std::uint32_t tuning_enabled = 0;
+    // Snapshot v3 adds closed-loop mitigation provenance. Baseline/current
+    // are synthetic Multimedia CPU milliseconds; 0xffffffff means unknown.
+    std::uint32_t auto_restores = 0;
+    std::uint32_t auto_baseline = 0xffffffffu;
+    std::uint32_t auto_current = 0xffffffffu;
+    std::uint32_t auto_pending = 0;      // 0 none, 1 reduce, 2 restore
+    std::uint32_t auto_last_reason = 0;  // see controller_auto::Reason
+    std::uint32_t auto_last_from = 0xffffffffu;
+    std::uint32_t auto_last_to = 0xffffffffu;
 };
-// Snapshot v2 adds per-knob diagnostics without changing the 28-byte
+// Snapshot v3 adds closed-loop mitigation provenance to the v2 diagnostics without changing the 28-byte
 // command wire format used by individual service tuning methods.
-constexpr std::uint32_t kSnapshotMagic = 0x41544332u; // ATC2
-constexpr std::size_t kSnapshotBytes = 8 + kNodeCount * 68 + 28 + 8;
+constexpr std::uint32_t kSnapshotMagic = 0x41544333u; // ATC3
+constexpr std::size_t kSnapshotBytes = 8 + kNodeCount * 68 + 28 + 8 + 28;
 inline Bytes encode(const Snapshot &s) {
     Bytes b; b.reserve(kSnapshotBytes);
     put(b, kSnapshotMagic); put(b, s.sequence);
@@ -108,6 +118,9 @@ inline Bytes encode(const Snapshot &s) {
     const auto last = encode(s.last);
     b.insert(b.end(), last.begin(), last.end());
     put(b, s.automatic); put(b, s.tuning_enabled);
+    put(b, s.auto_restores); put(b, s.auto_baseline);
+    put(b, s.auto_current); put(b, s.auto_pending);
+    put(b, s.auto_last_reason); put(b, s.auto_last_from); put(b, s.auto_last_to);
     return b;
 }
 inline bool decode_snapshot(const std::uint8_t *p, std::size_t size, Snapshot &s) {
@@ -130,7 +143,15 @@ inline bool decode_snapshot(const std::uint8_t *p, std::size_t size, Snapshot &s
     if (!decode(p + pos, 28, parsed.last)) return false;
     pos += 28;
     parsed.automatic = get(p + pos); pos += 4;
-    parsed.tuning_enabled = get(p + pos);
+    parsed.tuning_enabled = get(p + pos); pos += 4;
+    parsed.auto_restores = get(p + pos); pos += 4;
+    parsed.auto_baseline = get(p + pos); pos += 4;
+    parsed.auto_current = get(p + pos); pos += 4;
+    parsed.auto_pending = get(p + pos); pos += 4;
+    parsed.auto_last_reason = get(p + pos); pos += 4;
+    parsed.auto_last_from = get(p + pos); pos += 4;
+    parsed.auto_last_to = get(p + pos);
+    if (parsed.auto_pending > 2 || parsed.auto_last_reason > 5) return false;
     s = parsed; return true;
 }
 inline std::size_t index(Knob k) { return static_cast<std::size_t>(k) - 1u; }

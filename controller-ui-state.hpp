@@ -1,5 +1,6 @@
 #pragma once
 #include "controller-protocol.hpp"
+#include "controller-auto-policy.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -53,10 +54,16 @@ inline std::uint32_t adjust(Row row, std::uint32_t value, int dir) {
         return static_cast<std::uint32_t>(std::max<std::int64_t>(0,
                             std::min<std::int64_t>(4096, signed_value)));
     }
-    if (row.knob == controller::Knob::CpuWeight)
-        return static_cast<std::uint32_t>(std::max<std::int64_t>(1,
+    if (row.knob == controller::Knob::CpuWeight) {
+        // 0 means idle and sits immediately below 1. Respect a larger UI
+        // step above 1 but never skip the boundary on the way down.
+        if (dir > 0 && value == 0) return 1;
+        if (dir < 0 && value <= static_cast<std::uint32_t>(row.step))
+            return value == 0 ? 0u : (value == 1 ? 0u : 1u);
+        return static_cast<std::uint32_t>(std::max<std::int64_t>(0,
                    std::min<std::int64_t>(row.target == controller::Target::Qm ? 100 : 10000,
                                           signed_value)));
+    }
     const auto maxv = row.knob == controller::Knob::DemoCpu ?
                 (row.target == controller::Target::Sensors ? 300 : 2000) :
             row.knob == controller::Knob::DemoRam ? 1024 : 5;

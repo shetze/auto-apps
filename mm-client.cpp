@@ -1151,7 +1151,7 @@ public:
                   "  (CPU/RAM/MUTEX = synthetic; RT needs CAP_SYS_NICE)",
                   tune_mode ? PairWarning : PairMuted);
         const auto &items = controller_ui::rows();
-        const int visible = std::max(1, height - 20);
+        const int visible = std::max(1, height - 21);
         const int first = std::max(0, static_cast<int>(selected) - visible/2);
         const int last = std::min(static_cast<int>(items.size()), first + visible);
         for (int i = first; i < last; ++i) {
@@ -1172,14 +1172,31 @@ public:
                       is_selected);
         }
         const auto &last_cmd = view.last;
-        draw_text(height - 3, 2, width - 4,
+        draw_text(height - 4, 2, width - 4,
                   std::string("Last: ") + controller::target_name(last_cmd.target) +
                   " / " + controller::knob_name(last_cmd.knob) +
                   " / " + controller::status_name(last_cmd.status),
                   last_cmd.status == controller::Status::Ok ? PairGood : PairWarning);
+        const auto cpu_value = [](std::uint32_t v) {
+            return v == 0xffffffffu ? "?" : std::to_string(v);
+        };
+        const char *mode = view.auto_pending ? "WAITING FOR ACK" :
+                           view.auto_current == 0xffffffffu ? "WAITING FOR CPU GET" :
+                           view.auto_baseline != 0xffffffffu &&
+                           view.auto_current < view.auto_baseline ? "REDUCED" : "BASELINE";
+        draw_text(height - 3, 2, width - 4,
+                  std::string("AUTO QM CPU: ") + mode + "  current=" +
+                  cpu_value(view.auto_current) + "ms  baseline=" +
+                  cpu_value(view.auto_baseline) + "ms", PairMuted);
         draw_text(height - 2, 2, width - 4,
-                  "Automatic QM load reductions: " + std::to_string(view.automatic) +
-                  "  |  Limits protect the root/QM boundary", PairMuted);
+                  std::string("Last automatic cause: ") +
+                  controller_auto::reason_name(static_cast<controller_auto::Reason>(
+                      view.auto_last_reason)) + "  " + cpu_value(view.auto_last_from) +
+                  " -> " + cpu_value(view.auto_last_to) + " ms", PairMuted);
+        draw_text(height - 1, 2, width - 4,
+                  "Automatic reductions: " + std::to_string(view.automatic) +
+                  "  recoveries: " + std::to_string(view.auto_restores) +
+                  "  |  No automatic cgroup or RT tuning", PairMuted);
         refresh();
     }
 

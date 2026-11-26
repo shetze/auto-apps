@@ -6,24 +6,26 @@ other. These apps work both natively and in a container.
 
 ## Controller / resource tuning (AutoSD 10)
 
-The SOME/IP `controller-service` runs as a **Root `ipc_t` Podman container**, in
-parallel with Engine and Sensors. The restricted native
-`controller-host-agent` exposes only fixed, bounded systemd resource operations
-through a private Unix socket; it never participates in SOME/IP. The native
-`controller-qm-agent` reads and updates Multimedia container resources in the
-QM systemd manager. Its agent-specific vsomeip configuration is generated at
-startup for the **existing Unix-domain SOME/IP route** (rather than the refused
-Root TCP endpoint `10.88.0.1:31000`), without altering the shared
-`/etc/vsomeip.json`. All apps have explicit, checked client IDs in the RPM's
-`config/vsomeip-ipc.json`.
+The Root Controller runs inside an **`ipc_t`** container, with a separate
+restricted native Root systemd resource helper. In QM, a
+**`qm_container_ipc_t`** SOME/IP proxy for client ID `0x1005` communicates
+with a restricted native QM systemd helper over a private Unix socket. Thus
+both partitions keep their own systemd resource authority while the SOME/IP
+services use the established shared UDS route. The global
+`/etc/vsomeip.json` is unchanged.
 
-Press **`C`** in `multimedia-client` to open the Controller; **`T`** enters
-interactive tuning. Per-knob read status now distinguishes unknown, denied,
-offline, and timed-out values; `CPUWeight=idle` and default weights are
-represented correctly. Rebuild both Controller and Multimedia client together:
-the status snapshot wire format changed to `ATC2`. See
-**[CONTROLLER.md](CONTROLLER.md)** for deployment, key bindings, safety and
-verification. The Controller is a **demonstrator, not a safety controller**.
+Press `C` in `multimedia-client` for the Controller monitor and `T` for tuning.
+CPUWeight can now be lowered from numeric `1` to `idle` and raised again
+(`11 -> 1 -> idle -> 1`). The Controller records automatic Multimedia CPU
+load reductions, restores the original target in bounded steps after 90 seconds
+of stable CPU/RAM telemetry, and respects successful manual changes.
+It never automatically changes actual cgroup limits or real-time scheduling.
+
+The Controller status wire format is **ATC3**; rebuild the Controller and
+Multimedia client together. See **[CONTROLLER.md](CONTROLLER.md)** for
+architecture, migration from the native QM agent, tuning controls, security
+boundaries, target-system checks, and integration limitations. This is a
+demonstration controller, **not** a safety controller.
 
 ## The apps
 

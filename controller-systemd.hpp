@@ -133,6 +133,9 @@ inline std::uint32_t cpu_weight(const std::string &s) {
     return parse_uint(s, n) && n >= 1 && n <= 10000
             ? static_cast<std::uint32_t>(n) : 0xffffffffu;
 }
+inline std::string cpu_weight_assignment(std::uint32_t value) {
+    return "CPUWeight=" + (value == 0 ? std::string("idle") : std::to_string(value));
+}
 inline bool inspect(const std::string &unit, controller::Node &node,
                     bool qm_partition = false) {
     if (!is_unit(unit)) return false;
@@ -190,7 +193,7 @@ inline controller::Status apply(const std::string &unit, const controller::Comma
                                : "MemoryMax=infinity";
         }
     } else if (c.knob == controller::Knob::CpuWeight) {
-        property = "CPUWeight=" + std::to_string(c.value);
+        property = cpu_weight_assignment(c.value);
     } else if (c.knob == controller::Knob::Affinity) {
         // Cannot grant CPUs outside the unit's parent cpuset, even if the
         // request comes from the QM side. Inherited mask=0 clears override.

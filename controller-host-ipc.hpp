@@ -13,6 +13,7 @@
 
 namespace controller_host_ipc {
 constexpr const char *kSocket = "/run/ipc/auto-apps-controller/host.sock";
+constexpr const char *kQmSocket = "/run/ipc/auto-apps-qm-agent/qm.sock";
 inline bool request(const controller::Command &in, controller::Command &out,
                     const char *socket_path = kSocket, int timeout_ms = 2500) {
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);

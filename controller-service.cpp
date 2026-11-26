@@ -7,6 +7,8 @@
 #include "services.hpp"
 #include "vsomeip-identity.hpp"
 #include "demo-health.hpp"
+#include "controller-auto-policy.hpp"
+#include "demo-tuning.hpp"
 #include "controller-host-ipc.hpp"
 #include <vsomeip/vsomeip.hpp>
 #include <array>
@@ -41,6 +43,8 @@ public:
                  std::string(std::getenv("AUTO_APPS_CONTROLLER_TUNING")) == "1") {
         state_.tuning_enabled = enabled_ ? 1u : 0u;
         state_.last.status = controller::Status::Unknown;
+        auto_policy_.configured_baseline(demo_tuning::from_env(
+                "AUTO_APPS_MM_CPU_BASELINE_MS", 0, 2000));
     }
     bool init() {
         if (!app_ || !vsomeip_identity::init(app_, CONTROLLER_SERVICE_ID)) return false;
@@ -140,26 +144,32 @@ private:
         node.health = std::max(std::uint32_t(data.cpu), std::uint32_t(data.ram));
         last_health_[index] = Clock::now();
         node.age_ms = 0;
-        // Never adjust the real engine's CPU quota automatically. Only QM
-        // multimedia synthetic load is eligible for the conservative policy.
+        // CPU deadline misses, not RAM pressure or a held demo mutex, trigger
+        // synthetic QM load mitigation. The policy records the initial budget
+        // and restores it only after stable, fresh telemetry.
         if (index == 2) {
-            const bool degraded = data.cpu == demo_health::Level::Failed ||
-                                  data.cpu == demo_health::Level::Degraded;
-            degraded_streak_ = degraded ? degraded_streak_ + 1u : 0u;
             const auto now = Clock::now();
-            if (enabled_ && degraded_streak_ >= 5 &&
-                now >= next_auto_ &&
-                node.statuses[controller::index(controller::Knob::DemoCpu)] == controller::Status::Ok &&
-                node.values[controller::index(controller::Knob::DemoCpu)] >= 20) {
+            const auto key = controller::index(controller::Knob::DemoCpu);
+            const auto decision = auto_policy_.health(data, now, enabled_,
+                    node.available != 0,
+                    node.statuses[key] == controller::Status::Ok);
+            if (decision.action != controller_auto::Action::None) {
                 controller::Command command;
-                command.serial = 0x80000000u | (++auto_serial_ & 0x7fffffffu);
+                command.serial = 0x80000000u | (++auto_serial_ & 0x3fffffffu);
                 command.target = controller::Target::Multimedia;
                 command.knob = controller::Knob::DemoCpu;
-                command.value = node.values[controller::index(command.knob)] / 2u;
+                command.value = decision.to;
                 command.status = controller::Status::Pending;
+                pending_auto_serial_ = command.serial;
+                pending_auto_at_ = now;
                 queued_.push_back(command);
-                next_auto_ = now + std::chrono::seconds(60);
-                degraded_streak_ = 0;
+                std::cerr << "CONTROLLER AUTO: proposed "
+                          << controller_auto::action_name(decision.action)
+                          << " " << decision.from << " -> " << decision.to
+                          << " CPU ms because "
+                          << (decision.action == controller_auto::Action::Reduce
+                              ? "measured CPU deadline overruns" : "90s stable CPU/RAM health")
+                          << ", sample=" << data.sequence << '\n';
                 cv_.notify_all();
             }
         }
@@ -181,9 +191,20 @@ private:
         else {
             cmd.status = controller::Status::Pending;
             std::lock_guard<std::mutex> lock(mutex_);
-            if (queued_.size() >= 16)
+            if (queued_.size() >= 16 ||
+                (cmd.target == controller::Target::Multimedia &&
+                 cmd.knob == controller::Knob::DemoCpu &&
+                 (auto_policy_.pending() != controller_auto::Action::None ||
+                  manual_cpu_serial_ != 0))) {
                 cmd.status = controller::Status::Failed;
-            else { queued_.push_back(cmd); cv_.notify_all(); }
+            } else {
+                if (cmd.target == controller::Target::Multimedia &&
+                    cmd.knob == controller::Knob::DemoCpu) {
+                    auto_policy_.manual_submitted(Clock::now());
+                    manual_cpu_serial_ = cmd.serial;
+                }
+                queued_.push_back(cmd); cv_.notify_all();
+            }
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -213,22 +234,52 @@ private:
             state_.nodes[target].statuses[key] = cmd.status;
             state_.nodes[target].values[key] = cmd.status == controller::Status::Ok
                                                 ? cmd.value : 0xffffffffu;
+            if (target == 2 && key == controller::index(controller::Knob::DemoCpu) &&
+                cmd.status == controller::Status::Ok)
+                auto_policy_.observe(cmd.value);
             if (cmd.status != controller::Status::Ok)
                 std::cerr << "CONTROLLER: GET " << controller::target_name(cmd.target)
                           << "/" << controller::knob_name(cmd.knob) << " => "
                           << controller::status_name(cmd.status) << '\n';
             return;
         }
+        if (cmd.target == controller::Target::Multimedia &&
+            cmd.knob == controller::Knob::DemoCpu &&
+            pending_auto_serial_ == cmd.serial && pending_auto_serial_ != 0) {
+            const auto kind = auto_policy_.pending();
+            const auto prior = auto_policy_.current();
+            const bool ok = cmd.status == controller::Status::Ok;
+            auto_policy_.result(ok, cmd.value, Clock::now());
+            pending_auto_serial_ = 0;
+            pending_serial_[target][key] = 0; // discard a pre-SET GET
+            state_.nodes[target].statuses[key] = ok ? controller::Status::Ok : cmd.status;
+            state_.nodes[target].values[key] = ok ? cmd.value : 0xffffffffu;
+            std::cerr << "CONTROLLER AUTO: " << controller_auto::action_name(kind)
+                      << " " << prior << " -> " << cmd.value << " CPU ms "
+                      << (ok ? "APPLIED" : controller::status_name(cmd.status))
+                      << " (confirm next GET)\n";
+            cv_.notify_all();
+            return;
+        }
+        // Late or unrelated SET responses must not overwrite a newer value.
+        if (cmd.serial == 0 || cmd.serial != state_.last.serial) return;
+        if (cmd.target == controller::Target::Multimedia &&
+            cmd.knob == controller::Knob::DemoCpu &&
+            manual_cpu_serial_ == cmd.serial && manual_cpu_serial_ != 0) {
+            auto_policy_.manual_result(cmd.status == controller::Status::Ok,
+                                       cmd.value, Clock::now());
+            manual_cpu_serial_ = 0;
+            pending_serial_[target][key] = 0;
+            std::cerr << "CONTROLLER AUTO: manual CPU budget " << cmd.value
+                      << " ms => " << controller::status_name(cmd.status)
+                      << "; baseline " << auto_policy_.baseline() << " ms\n";
+        }
         if (cmd.status == controller::Status::Ok) {
             state_.nodes[target].values[key] = cmd.value;
             state_.nodes[target].statuses[key] = controller::Status::Ok;
         }
-        if (cmd.serial != 0) {
-            if ((cmd.serial & 0x80000000u) && cmd.status == controller::Status::Ok)
-                ++state_.automatic;
-            if (state_.last.serial == cmd.serial)
-                state_.last = cmd;
-        }
+        if (cmd.serial != 0 && state_.last.serial == cmd.serial)
+            state_.last = cmd;
     }
     void emit(const controller::Command &command) {
         vsomeip::service_t service = command.target == controller::Target::Multimedia &&
@@ -278,6 +329,17 @@ private:
         }
         if (cmd.serial != 0) {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_auto_serial_ == cmd.serial) {
+                auto_policy_.result(false, 0, Clock::now());
+                pending_auto_serial_ = 0;
+                auto &node = state_.nodes[static_cast<unsigned>(controller::Target::Multimedia)];
+                node.statuses[controller::index(controller::Knob::DemoCpu)] = cmd.status;
+                node.values[controller::index(controller::Knob::DemoCpu)] = 0xffffffffu;
+            }
+            if (manual_cpu_serial_ == cmd.serial) {
+                auto_policy_.manual_result(false, 0, Clock::now());
+                manual_cpu_serial_ = 0;
+            }
             if (state_.last.serial == cmd.serial)
                 state_.last = cmd;
         }
@@ -337,6 +399,9 @@ private:
                 return;
             }
             if (pending_serial_[idx][key] != 0) return;
+            // Do not issue a GET that can race with an in-flight CPU SET.
+            if (idx == 2 && key == controller::index(controller::Knob::DemoCpu) &&
+                (pending_auto_serial_ || manual_cpu_serial_)) return;
             // 0x40000000 disambiguates probe responses from writes (0x8...).
             cmd.serial = 0x40000000u | (++next_probe_serial_ & 0x3fffffffu);
             pending_serial_[idx][key] = cmd.serial;
@@ -383,7 +448,27 @@ private:
                 const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - last_health_[i]).count();
                 node.age_ms = static_cast<std::uint32_t>(std::min<std::int64_t>(age, 0xfffffffeLL));
-                if (age > 4000 || !node.available) node.health = 4;
+                if (age > 4000 || !node.available) {
+                    node.health = 4;
+                    if (i == 2) auto_policy_.no_fresh_health();
+                }
+            }
+            if (pending_auto_serial_ &&
+                now - pending_auto_at_ >= std::chrono::seconds(4)) {
+                std::cerr << "CONTROLLER AUTO: "
+                          << controller_auto::action_name(auto_policy_.pending())
+                          << " response TIMEOUT; suppressing further action until a fresh GET\n";
+                pending_auto_serial_ = 0;
+                auto_policy_.result(false, 0, now, true);
+                auto &cpu = state_.nodes[2];
+                cpu.values[controller::index(controller::Knob::DemoCpu)] = 0xffffffffu;
+                cpu.statuses[controller::index(controller::Knob::DemoCpu)] = controller::Status::Unknown;
+                pending_serial_[2][controller::index(controller::Knob::DemoCpu)] = 0;
+            }
+            if (manual_cpu_serial_ && state_.last.serial == manual_cpu_serial_ &&
+                now - pending_at_ >= std::chrono::seconds(4)) {
+                auto_policy_.manual_result(false, 0, now);
+                manual_cpu_serial_ = 0;
             }
             for (unsigned t=1; t<4; ++t) for (unsigned k=0; k<7; ++k) {
                 if (pending_serial_[t][k] &&
@@ -397,6 +482,14 @@ private:
                               << " => TIMEOUT\n";
                 }
             }
+            state_.automatic = auto_policy_.reductions();
+            state_.auto_restores = auto_policy_.restores();
+            state_.auto_baseline = auto_policy_.baseline();
+            state_.auto_current = auto_policy_.current();
+            state_.auto_pending = static_cast<std::uint32_t>(auto_policy_.pending());
+            state_.auto_last_reason = static_cast<std::uint32_t>(auto_policy_.last_reason());
+            state_.auto_last_from = auto_policy_.last_from();
+            state_.auto_last_to = auto_policy_.last_to();
             state_.sequence++;
             auto data = controller::encode(state_);
             lock.unlock();
@@ -419,9 +512,11 @@ private:
     std::array<Clock::time_point,4> last_health_{};
     std::deque<controller::Command> queued_;
     Clock::time_point pending_at_{};
-    Clock::time_point next_auto_{};
+    controller_auto::Policy auto_policy_;
+    std::uint32_t pending_auto_serial_ = 0;
+    std::uint32_t manual_cpu_serial_ = 0;
+    Clock::time_point pending_auto_at_{};
     unsigned auto_serial_ = 0;
-    unsigned degraded_streak_ = 0;
     unsigned next_probe_serial_ = 0;
     std::array<std::array<std::uint32_t,7>,4> pending_serial_{};
     std::array<std::array<Clock::time_point,7>,4> poll_pending_at_{};

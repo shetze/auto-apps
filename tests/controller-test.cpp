@@ -1,5 +1,6 @@
 #include "controller-protocol.hpp"
 #include "controller-systemd.hpp"
+#include "controller-agent-scope.hpp"
 #include "controller-ui-state.hpp"
 #include "demo-tuning.hpp"
 #include "fast-warning.hpp"
@@ -32,6 +33,13 @@ int main() {
     Snapshot s;
     s.sequence = 128;
     s.tuning_enabled = 1;
+    s.auto_baseline = 150;
+    s.auto_current = 75;
+    s.auto_last_from = 150;
+    s.auto_last_to = 75;
+    s.auto_last_reason = 1;
+    s.auto_pending = 0;
+    s.auto_restores = 0;
     s.last = set;
     s.nodes[0].available = 1;
     s.nodes[0].values[0] = 40;
@@ -42,6 +50,8 @@ int main() {
     assert(decode_snapshot(bytes.data(), bytes.size(), decoded));
     assert(decoded.sequence == 128 && decoded.tuning_enabled == 1);
     assert(decoded.nodes[0].values[0] == 40);
+    assert(decoded.auto_baseline == 150 && decoded.auto_current == 75);
+    assert(decoded.auto_last_reason == 1);
     assert(decoded.nodes[0].statuses[0] == Status::Ok);
     assert(controller_ui::format(Knob::CpuWeight, 0, Target::Qm) == "idle");
     assert(controller_ui::format(Knob::CpuWeight, 0xfffffffeu, Target::Engine) == "default (100)");
@@ -51,9 +61,33 @@ int main() {
     bytes[0] = 3;
     assert(!decode_snapshot(bytes.data(), bytes.size(), decoded));
     assert(controller_systemd::cpu_weight("idle") == 0);
+    assert(controller_systemd::cpu_weight_assignment(0) == "CPUWeight=idle");
+    assert(controller_systemd::cpu_weight_assignment(1) == "CPUWeight=1");
+    for (auto t : {Target::Qm, Target::Engine, Target::Multimedia, Target::Sensors}) {
+        Command idle{42, t, Knob::CpuWeight, 0, Status::Pending};
+        assert(valid(idle));
+        auto row = *std::find_if(controller_ui::rows().begin(), controller_ui::rows().end(), [t](const controller_ui::Row &r) {
+            return r.target == t && r.knob == Knob::CpuWeight;
+        });
+        assert(controller_ui::adjust(row, 11, -1) == 1);
+        assert(controller_ui::adjust(row, 1, -1) == 0);
+        assert(controller_ui::adjust(row, 0, -1) == 0);
+        assert(controller_ui::adjust(row, 0, +1) == 1);
+    }
     assert(controller_systemd::cpu_weight("[not set]") == 0xfffffffeu);
     assert(controller_systemd::cpu_weight("50") == 50);
     assert(controller_systemd::cpu_weight("not an int") == 0xffffffffu);
+    using controller_agent_scope::Scope;
+    assert(controller_agent_scope::unit_name(Target::Multimedia, Scope::Qm) ==
+           std::string("multimedia.service"));
+    assert(controller_agent_scope::unit_name(Target::Multimedia, Scope::Root) == nullptr);
+    assert(controller_agent_scope::unit_name(Target::Engine, Scope::Qm) == nullptr);
+    Command qm_read{123, Target::Multimedia, Knob::CpuWeight, 0, Status::Unknown};
+    assert(controller_agent_scope::allowed(qm_read, Scope::Qm));
+    qm_read.target = Target::Qm;
+    assert(!controller_agent_scope::allowed(qm_read, Scope::Qm));
+    qm_read.knob = Knob::RtPriority;
+    assert(!controller_agent_scope::allowed(qm_read, Scope::Root));
     assert(controller_systemd::is_unit("engine.service"));
     assert(!controller_systemd::is_unit("sshd.service"));
     assert(!controller_systemd::is_unit("../../etc/passwd"));
