@@ -69,15 +69,36 @@ class VsomeipIpcTests(unittest.TestCase):
         self.assertIn('SecurityLabelType=qm_container_ipc_t', agent)
         self.assertIn('Environment=VSOMEIP_CONFIGURATION='+PATH, agent)
         self.assertIn('Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0',agent)
-        self.assertIn('Volume=/run/ipc/auto-apps-qm-agent:/run/ipc/auto-apps-qm-agent:ro', agent)
+        self.assertIn('Volume=/run/auto-apps-qm-agent:/run/auto-apps-qm-agent:ro', agent)
         helper = qm_files['/etc/systemd/system/auto-apps-qm-resource-agent.service']
         self.assertIn('Environment=AUTO_APPS_AGENT_SCOPE=qm', helper)
         self.assertIn('ExecStart=/usr/bin/controller-host-agent', helper)
-        self.assertIn('ReadWritePaths=/run/ipc/auto-apps-qm-agent', helper)
+        self.assertIn('Type=notify', helper)
+        self.assertIn('NotifyAccess=main', helper)
+        self.assertIn('RuntimeDirectory=auto-apps-qm-agent', helper)
+        self.assertIn('RuntimeDirectoryMode=0700', helper)
+        self.assertIn('RuntimeDirectoryPreserve=restart', helper)
+        self.assertNotIn('ReadWritePaths=/run/ipc/', helper)
+        self.assertIn('Requires=routingmanagerd.service auto-apps-qm-resource-agent.service', agent)
+        self.assertIn('After=routingmanagerd.service auto-apps-qm-resource-agent.service', agent)
+        self.assertNotIn('Wants=auto-apps-qm-resource-agent.service', agent)
+        self.assertNotIn('Volume=/run/ipc/auto-apps-qm-agent', agent)
+        self.assertNotIn('/usr/lib/tmpfiles.d/auto-apps-qm-agent.conf', qm_files)
+        # The helper and QM proxy share one fixed QM-local path.  Neither
+        # component should recreate the old Root-shared ipc_var_run_t channel.
+        ipc_header = (ROOT/'controller-host-ipc.hpp').read_text()
+        helper_src = (ROOT/'controller-host-agent.cpp').read_text()
+        self.assertIn('kQmSocket = "/run/auto-apps-qm-agent/qm.sock"', ipc_header)
+        self.assertIn('kQmDirectory = "/run/auto-apps-qm-agent"', ipc_header)
+        self.assertIn('controller_host_ipc::kQmDirectory', helper_src)
+        self.assertIn('controller_systemd_notify::ready()', helper_src)
+        self.assertNotIn('"/run/ipc/auto-apps-qm-agent"', ipc_header)
         self.assertIn('Environment=AUTO_APPS_MM_CPU_BASELINE_MS=150',
                       root_files['/etc/containers/systemd/controller.container'])
-        self.assertIn('d /run/ipc/auto-apps-qm-agent 0700 root root',
-                      qm_files['/usr/lib/tmpfiles.d/auto-apps-qm-agent.conf'])
+        # No Root-side IPC mount should be created for the QM-internal helper.
+        self.assertNotIn('/usr/lib/tmpfiles.d/auto-apps-qm-agent.conf', root_files)
+        self.assertNotIn('RuntimeDirectory=auto-apps-qm-agent',
+                         root_files['/etc/systemd/system/auto-apps-controller-host-agent.service'])
         # Existing root/partition /etc/vsomeip.json must not be overwritten by
         # an IPC-only agent config. The agent preflight outputs to /run.
         self.assertIn('/etc/vsomeip.json',root_files)

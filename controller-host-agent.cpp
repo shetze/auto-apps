@@ -3,6 +3,7 @@
 // root-peer check, and a hard-coded unit/knob allowlist. Does not accept
 // arbitrary systemctl commands and never acts as a SOME/IP participant.
 #include "controller-host-ipc.hpp"
+#include "controller-systemd-notify.hpp"
 #include "controller-systemd.hpp"
 #include "controller-agent-scope.hpp"
 #include <atomic>
@@ -93,7 +94,7 @@ int main() {
     const char *socket_path = scope == Scope::Qm
         ? controller_host_ipc::kQmSocket : controller_host_ipc::kSocket;
     const char *directory_path = scope == Scope::Qm
-        ? "/run/ipc/auto-apps-qm-agent" : "/run/ipc/auto-apps-controller";
+        ? controller_host_ipc::kQmDirectory : "/run/ipc/auto-apps-controller";
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -101,7 +102,8 @@ int main() {
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::strcpy(address.sun_path, socket_path);
-    // Socket parent is created by the respective partition tmpfiles service.
+    // Root: tmpfiles in the root partition.  QM: the QM systemd manager
+    // owns this private RuntimeDirectory, not the root-shared /run/ipc mount.
     // Never follow an attacker-created path or replace a live agent.
     struct stat directory{};
     if (lstat(directory_path, &directory) != 0 ||
@@ -134,6 +136,15 @@ int main() {
     if (listen(fd, 8) != 0) {
         std::perror("HOST-AGENT: listen"); close(fd);
         unlink(socket_path); return 1;
+    }
+    // Type=notify for QM ensures the dependent Quadlet does not start before
+    // the native helper has successfully bound AND started listening. The
+    // root helper remains Type=simple and does not need a notify socket.
+    if (scope == Scope::Qm && !controller_systemd_notify::ready()) {
+        std::cerr << "RESOURCE-AGENT: unable to notify QM systemd of readiness\n";
+        close(fd);
+        unlink(socket_path);
+        return 1;
     }
     std::cout << "RESOURCE-AGENT: scope=" << (scope == Scope::Qm ? "QM" : "Root")
               << " socket=" << socket_path << " resource tuning " <<

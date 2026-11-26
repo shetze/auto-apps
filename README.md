@@ -277,3 +277,15 @@ resume Reverse immediately, followed by 20 seconds Forward. Watch the
 `ENGINE: CPU demo metrics` and Sensors health fields for CPU/performance
 samples. The specified 60-second period is the requested simulation schedule,
 not a real vehicle-control or functional-safety implementation.
+
+## QM controller resource socket (AutoSD)
+
+The native `auto-apps-qm-resource-agent.service` and the QM-local
+`controller-qm-agent.service` now exchange bounded resource commands through
+`/run/auto-apps-qm-agent/qm.sock` (not the Root-shared `/run/ipc` volume).
+The QM systemd manager provisions the private directory via `RuntimeDirectory`,
+and `Type=notify` defers the dependent Quadlet until the listener is ready.
+This fixes missing-directory and shared-IPC-directory startup errors observed
+on AutoSD 10. The native helper and the QM container still need SELinux
+permission to create/connect to this local socket; inspect AVCs if a later
+`bind` or `connect` fails. See `CONTROLLER.md` for target-system checks.

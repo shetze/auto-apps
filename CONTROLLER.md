@@ -21,7 +21,7 @@ systemd namespaces and explicitly separate scopes:
 - Root helper: default `AUTO_APPS_AGENT_SCOPE=root`; private `SOCK_SEQPACKET`
   socket `/run/ipc/auto-apps-controller/host.sock`.
 - QM helper: `AUTO_APPS_AGENT_SCOPE=qm`; private `SOCK_SEQPACKET` socket
-  `/run/ipc/auto-apps-qm-agent/qm.sock`.
+  `/run/auto-apps-qm-agent/qm.sock`.
 
 Both allow only three specific cgroup knobs (MemoryMax, CPUWeight, AllowedCPUs),
 validate target and values, check the connecting peer has UID 0, and accept
@@ -40,11 +40,29 @@ Only the new QM Quadlet offers that SOME/IP service. The old native Root
 `auto-apps-controller.service` likewise must not run beside `controller.service`.
 
 AutoSD uses `ipc_t` for the Root container, `qm_container_ipc_t` for the QM
-container, and separately managed systemd partitions. The controller proxy
-uses a read-only directory bind mount for the QM helper socket; the helper
-maintains the socket on the host QM side. SELinux AVCs or blocked sockets must
-be fixed with targeted permissions rather than `--privileged` or a host D-Bus
-mount. These assumptions must be tested on the actual AutoSD 10 image.
+container, and separately managed systemd partitions. The QM proxy mounts the QM-local `/run/auto-apps-qm-agent` directory read-only;
+the native QM helper owns `/run/auto-apps-qm-agent/qm.sock`. The QM systemd
+manager creates this **private** directory with
+`RuntimeDirectory=auto-apps-qm-agent` and mode `0700`. It is deliberately
+**outside `/run/ipc`**, which AutoSD shares between the Root and QM partitions.
+No Root-side tmpfiles entry or additional QM partition bind mount is needed
+for this channel. Root/QM SOME/IP and DLT continue to use the existing shared
+`/run/ipc` setup unchanged.
+
+The QM resource helper uses `Type=notify`: it signals `READY=1` only after
+`bind()` and `listen()` succeed. The QM Quadlet has `Requires=` and `After=`
+on this helper, avoiding the earlier race where Podman attempted to mount a
+nonexistent directory. `RuntimeDirectoryPreserve=restart` retains the same
+inode during helper restarts; the helper's existing stale-socket checks still
+apply. This avoids both observed startup failure classes:
+`226/NAMESPACE` / Podman `125` (missing directory) and attempts to bind in
+the Root-shared `ipc_var_run_t` directory (`Permission denied`).
+
+**SELinux warning:** This change reduces cross-partition exposure, but it does
+not prove the automotive SELinux policy permits the native QM helper to create
+its socket or `qm_container_ipc_t` to connect to it. Diagnose any remaining
+AVCs and add only targeted policy permissions; do not use `--privileged`,
+`chmod 777`, or a host D-Bus mount. Target-system validation is required.
 
 ## Monitor and manual tuning
 
@@ -127,8 +145,10 @@ QM checks, **inside `podman exec -it qm /bin/bash` from Root**:
 ```sh
 systemctl status controller-qm-agent.service auto-apps-qm-resource-agent.service multimedia.service
 journalctl -b -u controller-qm-agent.service -u auto-apps-qm-resource-agent.service --no-pager -n 100
-ls -ldZ /run/ipc/auto-apps-qm-agent
-ls -lZ /run/ipc/auto-apps-qm-agent/qm.sock /run/vsomeip/vsomeip-0
+systemctl show auto-apps-qm-resource-agent.service -p Type -p ActiveState -p SubState -p NRestarts -p RuntimeDirectory
+ls -ldZ /run/auto-apps-qm-agent
+ls -lZ /run/auto-apps-qm-agent/qm.sock /run/vsomeip/vsomeip-0
+findmnt -T /run/auto-apps-qm-agent -o TARGET,SOURCE,FSTYPE,OPTIONS
 systemctl show multimedia.service -p CPUWeight -p MemoryMax -p ControlGroup -p ActiveState
 ```
 
@@ -140,6 +160,14 @@ local `systemctl show`/cpuset data is accessible). First verify **read-only**
 values before testing any write. SELinux AVCs may still require specific
 local policy rules for native-helper socket access on the target; no extra
 kernel capabilities or blanket SELinux permissive mode are assumed here.
+
+If the QM resource helper still fails, first inspect its **new** journal
+entries. `HOST-AGENT: bind: Permission denied` after this path change is not
+necessarily a mount error: check the process label, directory label and AVC
+records. If the helper becomes active but the controller still reports
+`OFFLINE`, check that the QM proxy can connect to the *same* socket inode in
+its read-only bind mount and that SELinux allows the connect operation.
+Do not silently treat an `active` Quadlet state as an end-to-end link test.
 
 The QM native helper's write gate is `AUTO_APPS_HOST_AGENT_TUNING`; set to
 `0` to disable QM-side systemd writes. The Root helper has the same separate

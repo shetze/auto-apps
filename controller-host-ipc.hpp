@@ -1,6 +1,6 @@
 #pragma once
-// Small, bounded AF_UNIX SOCK_SEQPACKET protocol between the unprivileged
-// SOME/IP controller container and a native root-partition systemd helper.
+// Small, bounded AF_UNIX SOCK_SEQPACKET protocol between an ipc-labeled SOME/IP container and its native,
+// partition-local systemd resource helper.
 // Only a fixed 28-byte controller::Command can be sent; never arbitrary shell
 // arguments, file paths or unit names. Not exposed to the QM network.
 #include "controller-protocol.hpp"
@@ -13,7 +13,8 @@
 
 namespace controller_host_ipc {
 constexpr const char *kSocket = "/run/ipc/auto-apps-controller/host.sock";
-constexpr const char *kQmSocket = "/run/ipc/auto-apps-qm-agent/qm.sock";
+constexpr const char *kQmDirectory = "/run/auto-apps-qm-agent";
+constexpr const char *kQmSocket = "/run/auto-apps-qm-agent/qm.sock";
 inline bool request(const controller::Command &in, controller::Command &out,
                     const char *socket_path = kSocket, int timeout_ms = 2500) {
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);

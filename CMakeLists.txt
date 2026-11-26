@@ -49,7 +49,7 @@ add_executable(controller-service controller-service.cpp controller-auto-policy.
                controller-protocol.hpp demo-tuning.hpp services.hpp demo-health.hpp)
 target_link_libraries(controller-service vsomeip3 ${Boost_LIBRARIES})
 add_executable(controller-host-agent controller-host-agent.cpp controller-agent-scope.hpp controller-host-ipc.hpp
-               controller-systemd.hpp controller-protocol.hpp)
+               controller-systemd.hpp controller-systemd-notify.hpp controller-protocol.hpp)
 target_link_libraries(controller-host-agent pthread)
 
 add_executable(controller-qm-agent controller-qm-agent.cpp vsomeip-identity.hpp controller-host-ipc.hpp
@@ -95,6 +95,10 @@ if(BUILD_TESTING)
     target_include_directories(controller-host-ipc-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(controller-host-ipc-test pthread)
     add_test(NAME controller-host-ipc-test COMMAND controller-host-ipc-test)
+    add_executable(controller-systemd-notify-test tests/controller-systemd-notify-test.cpp
+                   controller-systemd-notify.hpp)
+    target_include_directories(controller-systemd-notify-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME controller-systemd-notify-test COMMAND controller-systemd-notify-test)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME qm-agent-config-test COMMAND ${Python3_EXECUTABLE}
